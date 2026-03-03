@@ -50,10 +50,10 @@ async fn fetch_example_com(
         .user_agent("bevy-tokio-example/0.1")
         .build()?;
 
-    let resp = client.get("https://example.com/").send().await?;
+    let resp = client.get("https://www.google.com/").send().await?;
     let status = resp.status();
     let body = resp.text().await?;
-    println!("Fetched example.com: status={status}, bytes={}", body.len());
+    println!("Fetched google.com: status={status}, bytes={}", body.len());
     world_id
         .ecs_task::<ResMut<MyResource>>()
         .run_system(Update, |mut my_resource| {
