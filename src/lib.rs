@@ -17,6 +17,7 @@ use core::{
     pin::Pin,
     task::{Context, Poll, Waker},
 };
+use std::any::Any;
 use std::sync::Condvar;
 
 pub struct AsyncEcsPlugin;
@@ -260,7 +261,7 @@ pub(crate) struct WaitBarrierRegistry(
     OnceLock<RwLock<HashMap<(WorldId, InternedScheduleLabel), Arc<WaitBarrier>>>>,
 );
 
-const WAIT_BARRIER_REGISTRY: WaitBarrierRegistry = WaitBarrierRegistry(OnceLock::new());
+static WAIT_BARRIER_REGISTRY: WaitBarrierRegistry = WaitBarrierRegistry(OnceLock::new());
 
 impl WakeRegistry {
     /// This function finds all pending `async_access` calls for a particular `Schedule` and a particular
@@ -273,6 +274,7 @@ impl WakeRegistry {
     /// Returns `Some` as long as the last call processed any number of waiting `async_access` calls.
     pub fn wait(&self, schedule: InternedScheduleLabel, world: &mut World) -> Option<()> {
         let world_id = world.id();
+        //println!("{:?}", WAIT_BARRIER_REGISTRY.0.get_or_init(|| RwLock::new(HashMap::new())).read().unwrap());
         let wait_barrier = WAIT_BARRIER_REGISTRY
             .0
             .get_or_init(|| RwLock::new(HashMap::new()))
@@ -326,54 +328,7 @@ impl WakeRegistry {
     }
 }
 
-struct ErasedSystemStateQueue {
-    thing: *const (),
-    drop_func: fn(*const ()),
-    clone_func: fn(*const ()) -> ErasedSystemStateQueue,
-}
-impl ErasedSystemStateQueue {
-    fn new<T: SystemParam + 'static>(t: Arc<ConcurrentQueue<SystemState<T>>>) -> Self {
-        fn drop_func<T: SystemParam + 'static>(thing: *const ()) {
-            unsafe { Arc::from_raw(thing as *const ConcurrentQueue<SystemState<T>>) };
-        }
-        fn clone_func<T: SystemParam + 'static>(thing: *const ()) -> ErasedSystemStateQueue {
-            let our_reference =
-                unsafe { Arc::from_raw(thing as *const ConcurrentQueue<SystemState<T>>) };
-            // does an extra arc clone to match with the extra drop.
-            drop(Arc::into_raw(our_reference.clone()));
-            ErasedSystemStateQueue {
-                thing,
-                drop_func: drop_func::<T>,
-                clone_func: clone_func::<T>,
-            }
-        }
-        Self {
-            thing: Arc::into_raw(t) as *const (),
-            drop_func: drop_func::<T>,
-            clone_func: clone_func::<T>,
-        }
-    }
-    unsafe fn clone_into<T: SystemParam + 'static>(&self) -> Arc<ConcurrentQueue<SystemState<T>>> {
-        let cloned = (self.clone_func)(self.thing);
-        unsafe { Arc::from_raw(cloned.thing as *const ConcurrentQueue<SystemState<T>>) }
-    }
-}
-impl Clone for ErasedSystemStateQueue {
-    fn clone(&self) -> Self {
-        (self.clone_func)(self.thing)
-    }
-}
-impl Drop for ErasedSystemStateQueue {
-    fn drop(&mut self) {
-        (self.drop_func)(self.thing);
-    }
-}
-unsafe impl Send for ErasedSystemStateQueue {}
-unsafe impl Sync for ErasedSystemStateQueue {}
-
-struct Uninitialized {
-    system_init_func: fn(&mut World, ErasedSystemStateQueue),
-}
+struct Uninitialized;
 
 struct ReadyToWake;
 
@@ -382,26 +337,23 @@ struct Awoken;
 struct NeedToApplySystemState;
 
 struct EcsTaskStateTransition<T> {
-    state_transition_resources: T,
-    system_apply_func: fn(&mut World, ErasedSystemStateQueue),
-    erased: ErasedSystemStateQueue,
+    state_transition_resources: PhantomData<T>,
+    system_handler: Arc<dyn SystemStateHandler>,
     waker: Waker,
 }
 
 impl EcsTaskStateTransition<Uninitialized> {
     fn initialize(self, world: &mut World) -> EcsTaskStateTransition<ReadyToWake> {
-        (self.state_transition_resources.system_init_func)(world, self.erased.clone());
+        self.system_handler.system_init(world);
         let Self {
-            system_apply_func,
-            erased,
+            system_handler,
             waker,
             ..
         } = self;
         EcsTaskStateTransition {
-            state_transition_resources: ReadyToWake,
-            system_apply_func,
-            erased,
+            system_handler,
             waker,
+            state_transition_resources: PhantomData,
         }
     }
 }
@@ -410,23 +362,21 @@ impl EcsTaskStateTransition<ReadyToWake> {
     fn wake(self) -> EcsTaskStateTransition<Awoken> {
         self.waker.wake_by_ref();
         let Self {
-            system_apply_func,
-            erased,
+            system_handler,
             waker,
             ..
         } = self;
         EcsTaskStateTransition {
-            state_transition_resources: Awoken,
-            system_apply_func,
-            erased,
+            system_handler,
             waker,
+            state_transition_resources: PhantomData,
         }
     }
 }
 
 impl EcsTaskStateTransition<NeedToApplySystemState> {
     fn apply_system_params(self, world: &mut World) {
-        (self.system_apply_func)(world, self.erased.clone());
+        self.system_handler.system_apply(world);
     }
 }
 
@@ -440,14 +390,12 @@ impl WaitBarrier {
             .into_iter()
             .map(
                 |EcsTaskStateTransition::<Awoken> {
-                     system_apply_func,
-                     erased,
+                     system_handler,
                      waker,
                      ..
                  }| EcsTaskStateTransition {
-                    state_transition_resources: NeedToApplySystemState,
-                    system_apply_func,
-                    erased,
+                    state_transition_resources: PhantomData,
+                    system_handler,
                     waker,
                 },
             )
@@ -588,7 +536,7 @@ where
     for<'w, 's> Func: FnOnce(P::Item<'w, 's>) -> Out,
 {
     let task_identifier = task_identifier.into();
-    let temp = WAIT_BARRIER_REGISTRY.0;
+    let temp = &WAIT_BARRIER_REGISTRY.0;
     let wait_barrier_registry = temp.get_or_init(|| RwLock::new(HashMap::new()));
     let world_id_schedule = (task_identifier.0.0, schedule.intern());
     if !wait_barrier_registry.read().unwrap().contains_key(&world_id_schedule) {
@@ -601,7 +549,7 @@ where
         Some(ecs_access),
         world_id_schedule,
         wait_teller,
-        Arc::new(ConcurrentQueue::bounded(1)),
+        Arc::new(SystemStateHandlerStruct::<P>(ConcurrentQueue::bounded(1))),
         FutureState::Uninitialized,
     )
     .await
@@ -643,9 +591,42 @@ struct PendingEcsCall<P: SystemParam + 'static, Func, Out>(
     Option<Func>,
     (WorldId, InternedScheduleLabel),
     WaitTeller,
-    Arc<ConcurrentQueue<SystemState<P>>>,
+    Arc<dyn SystemStateHandler>,
     FutureState,
 );
+
+trait SystemStateHandler: Send + Sync {
+    fn system_init(&self, world: &mut World);
+
+    fn system_apply(&self, world: &mut World);
+
+    fn as_any(&self) -> &dyn Any;
+}
+
+struct SystemStateHandlerStruct<P: SystemParam + 'static>(pub ConcurrentQueue<SystemState<P>>);
+
+impl<P: SystemParam + 'static> SystemStateHandler for SystemStateHandlerStruct<P> {
+    fn system_init(&self, world: &mut World) {
+        match self.0.push(SystemState::<P>::new(world)) {
+            Ok(_) => {}
+            Err(_) => panic!(),
+        }
+    }
+    fn system_apply(&self, world: &mut World) {
+        let Ok(mut system_state) = self.0.pop() else {
+            panic!()
+        };
+        system_state.apply(world);
+        match self.0.push(system_state) {
+            Ok(_) => {}
+            Err(_) => panic!(),
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self as &dyn Any
+    }
+}
 
 impl<P: SystemParam + 'static, Func, Out> Unpin for PendingEcsCall<P, Func, Out> {}
 
@@ -657,39 +638,18 @@ where
     type Output = Out;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        fn system_state_init<P: SystemParam + 'static>(
-            world: &mut World,
-            system_state_queue: ErasedSystemStateQueue,
-        ) {
-            let system_state_queue = unsafe {
-                Arc::from_raw(system_state_queue.thing as *const ConcurrentQueue<SystemState<P>>)
-            };
-            match system_state_queue.push(SystemState::<P>::new(world)) {
-                Ok(_) => {}
-                Err(_) => panic!(),
-            }
-        }
-        fn system_state_apply<P: SystemParam + 'static>(
-            world: &mut World,
-            system_state_queue: ErasedSystemStateQueue,
-        ) {
-            let system_state_queue = unsafe {
-                Arc::from_raw(system_state_queue.thing as *const ConcurrentQueue<SystemState<P>>)
-            };
-            let Ok(mut system_state) = system_state_queue.pop() else {
-                panic!()
-            };
-            system_state.apply(world);
-            match system_state_queue.push(system_state) {
-                Ok(_) => {}
-                Err(_) => panic!(),
-            }
-        }
         let world_id = self.3.0;
 
         match GLOBAL_WORLD_ACCESS.get(world_id, |world: UnsafeWorldCell| {
             // SAFETY: We have a fake-mutex around our world, so no one else can do mutable access to it.
-            let Ok(mut system_state) = self.5.pop() else {
+            let Ok(mut system_state) = self
+                .5
+                .as_any()
+                .downcast_ref::<SystemStateHandlerStruct<P>>()
+                .unwrap()
+                .0
+                .pop()
+            else {
                 return Poll::Pending;
             };
             let out;
@@ -722,7 +682,14 @@ where
                 let state = system_state.get_unchecked(world);
                 out = self.as_mut().2.take().unwrap()(state);
             }
-            match self.5.push(system_state) {
+            match self
+                .5
+                .as_any()
+                .downcast_ref::<SystemStateHandlerStruct<P>>()
+                .unwrap()
+                .0
+                .push(system_state)
+            {
                 Ok(_) => {}
                 Err(_) => panic!(),
             }
@@ -743,9 +710,8 @@ where
                         match global_wake_registry.1.try_send(
                             &self.3,
                             EcsTaskStateTransition {
-                                state_transition_resources: ReadyToWake,
-                                system_apply_func: system_state_apply::<P>,
-                                erased: ErasedSystemStateQueue::new(self.5.clone()),
+                                state_transition_resources: PhantomData,
+                                system_handler: self.5.clone(),
                                 waker: cx.waker().clone(),
                             },
                         ) {
@@ -759,12 +725,9 @@ where
                         match global_wake_registry.0.try_send(
                             &self.3,
                             EcsTaskStateTransition {
-                                state_transition_resources: Uninitialized {
-                                    system_init_func: system_state_init::<P>,
-                                },
-                                system_apply_func: system_state_apply::<P>,
-                                erased: ErasedSystemStateQueue::new(self.5.clone()),
+                                system_handler: self.5.clone(),
                                 waker: cx.waker().clone(),
+                                state_transition_resources: PhantomData,
                             },
                         ) {
                             Ok(_) => {}
@@ -772,6 +735,7 @@ where
                             // the concurrent queue here is unbounded.
                             Err(_) => unreachable!(),
                         }
+                        self.6 = FutureState::Initialized;
                     }
                 }
                 self.4.signal();
