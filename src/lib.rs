@@ -22,135 +22,38 @@ use std::sync::Condvar;
 
 pub struct AsyncEcsPlugin;
 
-#[derive(Debug)]
-struct State {
-    connected: isize,
-    waiting_for: isize,
-}
-
-#[derive(Debug, Clone)]
-pub struct WaitBarrier {
-    inner: Arc<Inner>,
-}
-
-#[derive(Debug)]
-struct Inner {
-    mu: Mutex<State>,
-    cv: Condvar,
-}
-
-impl WaitBarrier {
+#[derive(Clone)]
+struct MyBarrier(Arc<(Mutex<bool>, Condvar)>);
+impl MyBarrier {
     pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Inner {
-                mu: Mutex::new(State {
-                    connected: 0,
-                    waiting_for: 0,
-                }),
-                cv: Condvar::new(),
-            }),
-        }
+        MyBarrier(Arc::new((Mutex::new(false), Condvar::new())))
     }
-
-    /// Create a teller (a "boi") linked to this barrier.
-    pub fn new_wait_teller(&self) -> WaitTeller {
-        let mut st = self.inner.mu.lock().unwrap();
-        st.connected += 1;
-        // Note: do NOT touch waiting_for here. A new teller doesn't retroactively
-        // affect already-issued waits; it only affects future wait() calls.
-        drop(st);
-
-        WaitTeller {
-            inner: self.inner.clone(),
-            // Optional safety: prevent double-drop bookkeeping if you add an explicit disconnect().
-            alive: true,
-        }
-    }
-
-    /// Wait for *one signal from each currently-connected teller*.
-    ///
-    /// Semantics: increments `waiting_for` by `connected` and blocks until
-    /// enough `signal()`/drops have happened to make `waiting_for <= 0`.
     pub fn wait(&self) {
-        let mut st = self.inner.mu.lock().unwrap();
+        let (lock, cv) = &*self.0;
+        let mut signaled = lock.lock().unwrap();
 
-        // If nobody is connected, this wait is trivially satisfied.
-        if st.connected <= 0 {
-            return;
+        while !*signaled {
+            signaled = cv.wait(signaled).unwrap();
         }
 
-        st.waiting_for += st.connected;
-
-        while st.waiting_for > 0 {
-            st = self.inner.cv.wait(st).unwrap();
-        }
+        // Optional: auto-reset after one waiter passes through.
+        //*signaled = false;
     }
 
-    /// Non-blocking: "issue" a wait demand, returning how many signals are now required.
-    /// (Handy for debugging/metrics.)
-    pub fn issue_wait(&self) -> isize {
-        let mut st = self.inner.mu.lock().unwrap();
-        if st.connected > 0 {
-            st.waiting_for += st.connected;
-        }
-        st.waiting_for
-    }
-
-    /// Debug/metrics helpers (optional)
-    pub fn connected(&self) -> isize {
-        self.inner.mu.lock().unwrap().connected
-    }
-    pub fn waiting_for(&self) -> isize {
-        self.inner.mu.lock().unwrap().waiting_for
-    }
-}
-
-#[derive(Debug)]
-pub struct WaitTeller {
-    inner: Arc<Inner>,
-    alive: bool,
-}
-
-impl WaitTeller {
-    /// One "unit" of progress (finished / pending / poll complete, etc.).
     pub fn signal(&self) {
-        let mut st = self.inner.mu.lock().unwrap();
-        st.waiting_for -= 1;
-
-        // If this satisfies current waits, wake everyone.
-        if st.waiting_for <= 0 {
-            self.inner.cv.notify_all();
-        }
-    }
-
-    /// Optional explicit disconnect (so you can drop later without double bookkeeping).
-    pub fn disconnect(&mut self) {
-        self.do_drop_bookkeeping();
-        // prevent Drop from doing it again
-        self.alive = false;
-    }
-
-    fn do_drop_bookkeeping(&mut self) {
-        let mut st = self.inner.mu.lock().unwrap();
-        st.connected -= 1;
-
-        // Dropping reduces the number of signals we should still expect
-        // from "currently outstanding" waits.
-        st.waiting_for -= 1;
-
-        if st.waiting_for <= 0 {
-            self.inner.cv.notify_all();
-        }
+        let (lock, cv) = &*self.0;
+        let mut signaled = lock.lock().unwrap();
+        *signaled = true;
+        cv.notify_one();
     }
 }
-
-impl Drop for WaitTeller {
+impl Drop for MyBarrier {
     fn drop(&mut self) {
-        if self.alive {
-            self.do_drop_bookkeeping();
-        }
+        self.signal();
     }
 }
+
+struct WakerBarrier(Waker, MyBarrier);
 
 impl bevy_app::Plugin for AsyncEcsPlugin {
     fn build(&self, app: &mut bevy_app::App) {
@@ -252,16 +155,10 @@ pub(crate) static GLOBAL_WAKE_REGISTRY: WakeRegistry = WakeRegistry(OnceLock::ne
 /// Is the `GLOBAL_WAKE_REGISTRY`
 pub(crate) struct WakeRegistry(
     OnceLock<(
-        KeyedQueues<(WorldId, InternedScheduleLabel), EcsTaskStateTransition<Uninitialized>>,
-        KeyedQueues<(WorldId, InternedScheduleLabel), EcsTaskStateTransition<ReadyToWake>>,
+        KeyedQueues<(WorldId, InternedScheduleLabel), Uninitialized>,
+        KeyedQueues<(WorldId, InternedScheduleLabel), ReadyToWake>,
     )>,
 );
-
-pub(crate) struct WaitBarrierRegistry(
-    OnceLock<RwLock<HashMap<(WorldId, InternedScheduleLabel), Arc<WaitBarrier>>>>,
-);
-
-static WAIT_BARRIER_REGISTRY: WaitBarrierRegistry = WaitBarrierRegistry(OnceLock::new());
 
 impl WakeRegistry {
     /// This function finds all pending `async_access` calls for a particular `Schedule` and a particular
@@ -274,14 +171,6 @@ impl WakeRegistry {
     /// Returns `Some` as long as the last call processed any number of waiting `async_access` calls.
     pub fn wait(&self, schedule: InternedScheduleLabel, world: &mut World) -> Option<()> {
         let world_id = world.id();
-        //println!("{:?}", WAIT_BARRIER_REGISTRY.0.get_or_init(|| RwLock::new(HashMap::new())).read().unwrap());
-        let wait_barrier = WAIT_BARRIER_REGISTRY
-            .0
-            .get_or_init(|| RwLock::new(HashMap::new()))
-            .read()
-            .unwrap()
-            .get(&(world_id, schedule))
-            .cloned()?;
         let global_wake_registry = GLOBAL_WAKE_REGISTRY
             .0
             .get_or_init(|| (KeyedQueues::new(), KeyedQueues::new()));
@@ -302,7 +191,7 @@ impl WakeRegistry {
             .get_or_create(&(world_id, schedule))
             .pop()
         {
-            ecs_tasks.push(ecs_task.initialize(world));
+           ecs_tasks.push(ecs_task.initialize(world))
         }
         while let Ok(ecs_task) = global_wake_registry
             .1
@@ -313,11 +202,7 @@ impl WakeRegistry {
         }
         let mut need_to_apply_system_state = None;
         GLOBAL_WORLD_ACCESS.set(world, || {
-            let ecs_tasks: Vec<_> = ecs_tasks
-                .into_iter()
-                .map(EcsTaskStateTransition::<ReadyToWake>::wake)
-                .collect();
-            let ecs_tasks = wait_barrier.wait_for_async_tasks(ecs_tasks);
+            let ecs_tasks = wait_for_async_tasks(ecs_tasks);
             need_to_apply_system_state = Some(ecs_tasks);
         })?;
         // Applies all the commands stored up to the world and other system state
@@ -328,79 +213,78 @@ impl WakeRegistry {
     }
 }
 
-struct Uninitialized;
-
-struct ReadyToWake;
-
-struct Awoken;
-
-struct NeedToApplySystemState;
-
-struct EcsTaskStateTransition<T> {
-    state_transition_resources: PhantomData<T>,
-    system_handler: Arc<dyn SystemStateHandler>,
-    waker: Waker,
+struct Uninitialized {
+    system_state_handler: Arc<dyn SystemStateHandler>,
+    waker: WakerBarrier,
 }
 
-impl EcsTaskStateTransition<Uninitialized> {
-    fn initialize(self, world: &mut World) -> EcsTaskStateTransition<ReadyToWake> {
-        self.system_handler.system_init(world);
+struct ReadyToWake {
+    system_state_handler: Arc<dyn SystemStateHandler>,
+    waker: WakerBarrier,
+}
+
+struct Awoken {
+    system_state_handler: Arc<dyn SystemStateHandler>,
+    barrier: MyBarrier,
+}
+
+struct NeedToApplySystemState {
+    system_state_handler: Arc<dyn SystemStateHandler>,
+}
+
+impl Uninitialized {
+    fn initialize(self, world: &mut World) -> ReadyToWake {
+        self.system_state_handler.system_init(world);
         let Self {
-            system_handler,
+            system_state_handler,
             waker,
-            ..
         } = self;
-        EcsTaskStateTransition {
-            system_handler,
+        ReadyToWake {
+            system_state_handler,
             waker,
-            state_transition_resources: PhantomData,
         }
     }
 }
 
-impl EcsTaskStateTransition<ReadyToWake> {
-    fn wake(self) -> EcsTaskStateTransition<Awoken> {
-        self.waker.wake_by_ref();
-        let Self {
-            system_handler,
-            waker,
-            ..
-        } = self;
-        EcsTaskStateTransition {
-            system_handler,
-            waker,
-            state_transition_resources: PhantomData,
-        }
-    }
-}
-
-impl EcsTaskStateTransition<NeedToApplySystemState> {
+impl NeedToApplySystemState {
     fn apply_system_params(self, world: &mut World) {
-        self.system_handler.system_apply(world);
+        self.system_state_handler.system_apply(world);
     }
 }
 
-impl WaitBarrier {
-    pub fn wait_for_async_tasks(
-        &self,
-        ecs_tasks: Vec<EcsTaskStateTransition<Awoken>>,
-    ) -> Vec<EcsTaskStateTransition<NeedToApplySystemState>> {
-        self.wait();
-        ecs_tasks
-            .into_iter()
-            .map(
-                |EcsTaskStateTransition::<Awoken> {
-                     system_handler,
-                     waker,
-                     ..
-                 }| EcsTaskStateTransition {
-                    state_transition_resources: PhantomData,
-                    system_handler,
-                    waker,
-                },
-            )
-            .collect()
-    }
+pub fn wait_for_async_tasks(ecs_tasks: Vec<ReadyToWake>) -> Vec<NeedToApplySystemState> {
+    let ecs_tasks = ecs_tasks
+        .into_iter()
+        .map(
+            |ReadyToWake {
+                 system_state_handler,
+                 waker,
+             }| {
+                println!("calling wake");
+                waker.0.wake();
+                Awoken {
+                    system_state_handler,
+                    barrier: waker.1,
+                }
+            },
+        )
+        // we re-collect to ensure we fully exhaust the prior iterator
+        // we want to have all the wakers call .wake() before the first barrier calls .wait()
+        .collect::<Vec<_>>();
+    bevy_tasks::tick_global_task_pools_on_main_thread();
+        ecs_tasks.into_iter()
+        .map(
+            |Awoken {
+                 system_state_handler,
+                 barrier,
+             }| {
+                barrier.wait();
+                NeedToApplySystemState {
+                    system_state_handler,
+                }
+            },
+        )
+        .collect()
 }
 
 // We have a couple of transitions
@@ -536,19 +420,12 @@ where
     for<'w, 's> Func: FnOnce(P::Item<'w, 's>) -> Out,
 {
     let task_identifier = task_identifier.into();
-    let temp = &WAIT_BARRIER_REGISTRY.0;
-    let wait_barrier_registry = temp.get_or_init(|| RwLock::new(HashMap::new()));
-    let world_id_schedule = (task_identifier.0.0, schedule.intern());
-    if !wait_barrier_registry.read().unwrap().contains_key(&world_id_schedule) {
-        wait_barrier_registry.write().unwrap().insert(world_id_schedule, Arc::new(WaitBarrier::new()));
-    }
-    let wait_teller = wait_barrier_registry.read().unwrap().get(&world_id_schedule).unwrap().new_wait_teller();
     PendingEcsCall::<P, Func, Out>(
         PhantomData::<P>,
         PhantomData,
         Some(ecs_access),
-        world_id_schedule,
-        wait_teller,
+         (task_identifier.0.0, schedule.intern()),
+        None,
         Arc::new(SystemStateHandlerStruct::<P>(ConcurrentQueue::bounded(1))),
         FutureState::Uninitialized,
     )
@@ -590,7 +467,7 @@ struct PendingEcsCall<P: SystemParam + 'static, Func, Out>(
     PhantomData<Out>,
     Option<Func>,
     (WorldId, InternedScheduleLabel),
-    WaitTeller,
+    Option<MyBarrier>,
     Arc<dyn SystemStateHandler>,
     FutureState,
 );
@@ -638,6 +515,7 @@ where
     type Output = Out;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        println!("polling!");
         let world_id = self.3.0;
 
         match GLOBAL_WORLD_ACCESS.get(world_id, |world: UnsafeWorldCell| {
@@ -693,7 +571,10 @@ where
                 Ok(_) => {}
                 Err(_) => panic!(),
             }
-            self.4.disconnect();
+            if let Some(awa) = self.4.take() {
+                awa.signal();
+            }
+            //self.4.disconnect();
             Poll::Ready(out)
         }) {
             Some(Poll::Ready(out)) => Poll::Ready(out),
@@ -705,14 +586,19 @@ where
                 let global_wake_registry = GLOBAL_WAKE_REGISTRY
                     .0
                     .get_or_init(|| (KeyedQueues::new(), KeyedQueues::new()));
+                println!("making wait barrier");
+                let wait_barrier = MyBarrier::new();
+                if let Some(awa) = self.4.replace(wait_barrier.clone()) {
+                    awa.signal();
+                }
                 match self.6 {
                     FutureState::Initialized => {
+                        println!("sending initalized");
                         match global_wake_registry.1.try_send(
                             &self.3,
-                            EcsTaskStateTransition {
-                                state_transition_resources: PhantomData,
-                                system_handler: self.5.clone(),
-                                waker: cx.waker().clone(),
+                            ReadyToWake {
+                                system_state_handler: self.5.clone(),
+                                waker: WakerBarrier(cx.waker().clone(), wait_barrier),
                             },
                         ) {
                             Ok(_) => {}
@@ -722,12 +608,12 @@ where
                         }
                     }
                     FutureState::Uninitialized => {
+                        println!("sending uninitalized");
                         match global_wake_registry.0.try_send(
                             &self.3,
-                            EcsTaskStateTransition {
-                                system_handler: self.5.clone(),
-                                waker: cx.waker().clone(),
-                                state_transition_resources: PhantomData,
+                            Uninitialized {
+                                system_state_handler: self.5.clone(),
+                                waker: WakerBarrier(cx.waker().clone(), wait_barrier),
                             },
                         ) {
                             Ok(_) => {}
@@ -738,7 +624,6 @@ where
                         self.6 = FutureState::Initialized;
                     }
                 }
-                self.4.signal();
                 Poll::Pending
             }
         }

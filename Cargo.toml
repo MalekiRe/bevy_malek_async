@@ -11,6 +11,7 @@ description = "async runtime agnostic access to the bevy ecs"
 bevy_app = "0.18.0"
 bevy_platform = "0.18.0"
 bevy_ecs = "0.18.0"
+bevy_tasks = "0.18.1"
 concurrent-queue = "2.5.0"
 
 [dev-dependencies]
