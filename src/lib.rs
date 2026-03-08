@@ -9,15 +9,15 @@ use bevy_ecs::{
 };
 use bevy_platform::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock, atomic::*},
 };
 use concurrent_queue::ConcurrentQueue;
 use core::{
     marker::PhantomData,
     pin::Pin,
+    any::Any,
     task::{Context, Poll, Waker},
 };
-use std::any::Any;
 use std::sync::Condvar;
 
 pub struct AsyncEcsPlugin;
@@ -39,17 +39,13 @@ impl MyBarrier {
         // Optional: auto-reset after one waiter passes through.
         //*signaled = false;
     }
-
-    pub fn signal(&self) {
+}
+impl Drop for MyBarrier {
+    fn drop(&mut self) {
         let (lock, cv) = &*self.0;
         let mut signaled = lock.lock().unwrap();
         *signaled = true;
         cv.notify_one();
-    }
-}
-impl Drop for MyBarrier {
-    fn drop(&mut self) {
-        self.signal();
     }
 }
 
@@ -191,7 +187,7 @@ impl WakeRegistry {
             .get_or_create(&(world_id, schedule))
             .pop()
         {
-           ecs_tasks.push(ecs_task.initialize(world))
+            ecs_tasks.push(ecs_task.initialize(world))
         }
         while let Ok(ecs_task) = global_wake_registry
             .1
@@ -260,7 +256,6 @@ pub fn wait_for_async_tasks(ecs_tasks: Vec<ReadyToWake>) -> Vec<NeedToApplySyste
                  system_state_handler,
                  waker,
              }| {
-                println!("calling wake");
                 waker.0.wake();
                 Awoken {
                     system_state_handler,
@@ -272,7 +267,8 @@ pub fn wait_for_async_tasks(ecs_tasks: Vec<ReadyToWake>) -> Vec<NeedToApplySyste
         // we want to have all the wakers call .wake() before the first barrier calls .wait()
         .collect::<Vec<_>>();
     bevy_tasks::tick_global_task_pools_on_main_thread();
-        ecs_tasks.into_iter()
+    ecs_tasks
+        .into_iter()
         .map(
             |Awoken {
                  system_state_handler,
@@ -387,11 +383,19 @@ impl WorldAccessRegistry {
 }
 
 impl<P: bevy_ecs::system::SystemParam + 'static> EcsTask<P> {
-    pub async fn run_system<Func, Out>(self, schedule: impl ScheduleLabel, ecs_access: Func) -> Out
+    /// Allows you to access the ECS from any arbitrary async runtime.
+    pub async fn run_system<Func, Out>(&self, schedule: impl ScheduleLabel, ecs_access: Func) -> Out
     where
         for<'w, 's> Func: FnOnce(P::Item<'w, 's>) -> Out,
     {
-        async_access(self, schedule, ecs_access).await
+        PendingEcsCall::<P, Func, Out> {
+            phantom_data: Default::default(),
+            ecs_func: Some(ecs_access),
+            world_id_schedule: (self.world_id, schedule.intern()),
+            barrier: None,
+            system_state_handler: self.system_state_handler.clone(),
+        }
+        .await
     }
 }
 
@@ -401,35 +405,15 @@ pub trait CreateEcsTask {
 
 impl CreateEcsTask for WorldId {
     fn ecs_task<P: SystemParam + 'static>(self) -> EcsTask<P> {
-        EcsTask::new(self)
+        EcsTask {
+            phantom_data: Default::default(),
+            world_id: self,
+            system_state_handler: Arc::new(SystemStateHandlerStruct::<P>(
+                ConcurrentQueue::bounded(1),
+                AtomicBool::new(false),
+            )),
+        }
     }
-}
-
-#[rustfmt::skip]
-/// Allows you to access the ECS from any arbitrary async runtime.
-/// Calls will never return immediately and will always start Pending at least once.
-/// Call this with the same `EcsTask` to persist `SystemParams` like `Local` or `Changed`
-/// Just use `world_id` if you do not mind a new `SystemParam` being initialized every time.
-async fn async_access<P, Func, Out>(
-    task_identifier: impl Into<EcsTask<P>>,
-    schedule: impl ScheduleLabel,
-    ecs_access: Func,
-) -> Out
-where
-    P: SystemParam + 'static,
-    for<'w, 's> Func: FnOnce(P::Item<'w, 's>) -> Out,
-{
-    let task_identifier = task_identifier.into();
-    PendingEcsCall::<P, Func, Out>(
-        PhantomData::<P>,
-        PhantomData,
-        Some(ecs_access),
-         (task_identifier.0.0, schedule.intern()),
-        None,
-        Arc::new(SystemStateHandlerStruct::<P>(ConcurrentQueue::bounded(1))),
-        FutureState::Uninitialized,
-    )
-    .await
 }
 
 #[derive(PartialOrd, PartialEq, Eq, Ord, Hash, Debug, Copy, Clone)]
@@ -438,39 +422,20 @@ enum FutureState {
     Uninitialized,
 }
 
-impl<P: SystemParam + 'static> From<WorldId> for EcsTask<P> {
-    fn from(value: WorldId) -> Self {
-        EcsTask(Arc::new(InternalEcsTask(value, PhantomData)))
-    }
+struct PendingEcsCall<P: SystemParam + 'static, Func, Out> {
+    phantom_data: PhantomData<(P, Out)>,
+    ecs_func: Option<Func>,
+    world_id_schedule: (WorldId, InternedScheduleLabel),
+    barrier: Option<MyBarrier>,
+    system_state_handler: Arc<dyn SystemStateHandler>,
 }
 
 /// An `EcsTask` can be re-used in order to persist `SystemParams` like `Local`, `Changed`, or `Added`
-pub struct EcsTask<P: SystemParam + 'static>(Arc<InternalEcsTask<P>>);
-
-struct InternalEcsTask<P: SystemParam + 'static>(WorldId, PhantomData<P>);
-
-impl<P: SystemParam + 'static> Clone for EcsTask<P> {
-    fn clone(&self) -> Self {
-        EcsTask(self.0.clone())
-    }
+pub struct EcsTask<P: SystemParam + 'static> {
+    phantom_data: PhantomData<P>,
+    world_id: WorldId,
+    system_state_handler: Arc<dyn SystemStateHandler>,
 }
-impl<P: SystemParam + 'static> EcsTask<P> {
-    /// Generates a new unique `EcsTask` that can be re-used in order to persist `SystemParams`
-    /// like `Local`, `Changed`, or `Added`
-    pub fn new(world_id: WorldId) -> Self {
-        Self(Arc::new(InternalEcsTask(world_id, PhantomData)))
-    }
-}
-
-struct PendingEcsCall<P: SystemParam + 'static, Func, Out>(
-    PhantomData<P>,
-    PhantomData<Out>,
-    Option<Func>,
-    (WorldId, InternedScheduleLabel),
-    Option<MyBarrier>,
-    Arc<dyn SystemStateHandler>,
-    FutureState,
-);
 
 trait SystemStateHandler: Send + Sync {
     fn system_init(&self, world: &mut World);
@@ -478,9 +443,14 @@ trait SystemStateHandler: Send + Sync {
     fn system_apply(&self, world: &mut World);
 
     fn as_any(&self) -> &dyn Any;
+
+    fn future_state(&self) -> FutureState;
 }
 
-struct SystemStateHandlerStruct<P: SystemParam + 'static>(pub ConcurrentQueue<SystemState<P>>);
+struct SystemStateHandlerStruct<P: SystemParam + 'static>(
+    pub ConcurrentQueue<SystemState<P>>,
+    AtomicBool,
+);
 
 impl<P: SystemParam + 'static> SystemStateHandler for SystemStateHandlerStruct<P> {
     fn system_init(&self, world: &mut World) {
@@ -488,6 +458,7 @@ impl<P: SystemParam + 'static> SystemStateHandler for SystemStateHandlerStruct<P
             Ok(_) => {}
             Err(_) => panic!(),
         }
+        self.1.store(true, Ordering::Relaxed);
     }
     fn system_apply(&self, world: &mut World) {
         let Ok(mut system_state) = self.0.pop() else {
@@ -503,6 +474,13 @@ impl<P: SystemParam + 'static> SystemStateHandler for SystemStateHandlerStruct<P
     fn as_any(&self) -> &dyn Any {
         self as &dyn Any
     }
+
+    fn future_state(&self) -> FutureState {
+        match self.1.load(Ordering::Relaxed) {
+            true => FutureState::Initialized,
+            false => FutureState::Uninitialized,
+        }
+    }
 }
 
 impl<P: SystemParam + 'static, Func, Out> Unpin for PendingEcsCall<P, Func, Out> {}
@@ -515,13 +493,12 @@ where
     type Output = Out;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        println!("polling!");
-        let world_id = self.3.0;
+        let world_id = self.world_id_schedule.0;
 
         match GLOBAL_WORLD_ACCESS.get(world_id, |world: UnsafeWorldCell| {
             // SAFETY: We have a fake-mutex around our world, so no one else can do mutable access to it.
             let Ok(mut system_state) = self
-                .5
+                .system_state_handler
                 .as_any()
                 .downcast_ref::<SystemStateHandlerStruct<P>>()
                 .unwrap()
@@ -558,10 +535,10 @@ where
                     );
                 }
                 let state = system_state.get_unchecked(world);
-                out = self.as_mut().2.take().unwrap()(state);
+                out = self.as_mut().ecs_func.take().unwrap()(state);
             }
             match self
-                .5
+                .system_state_handler
                 .as_any()
                 .downcast_ref::<SystemStateHandlerStruct<P>>()
                 .unwrap()
@@ -571,9 +548,7 @@ where
                 Ok(_) => {}
                 Err(_) => panic!(),
             }
-            if let Some(awa) = self.4.take() {
-                awa.signal();
-            }
+            self.barrier.take();
             //self.4.disconnect();
             Poll::Ready(out)
         }) {
@@ -586,44 +561,33 @@ where
                 let global_wake_registry = GLOBAL_WAKE_REGISTRY
                     .0
                     .get_or_init(|| (KeyedQueues::new(), KeyedQueues::new()));
-                println!("making wait barrier");
                 let wait_barrier = MyBarrier::new();
-                if let Some(awa) = self.4.replace(wait_barrier.clone()) {
-                    awa.signal();
-                }
-                match self.6 {
-                    FutureState::Initialized => {
-                        println!("sending initalized");
-                        match global_wake_registry.1.try_send(
-                            &self.3,
+                self.barrier.replace(wait_barrier.clone());
+                match self.system_state_handler.future_state() {
+                    FutureState::Initialized => global_wake_registry
+                        .1
+                        .try_send(
+                            &self.world_id_schedule,
                             ReadyToWake {
-                                system_state_handler: self.5.clone(),
+                                system_state_handler: self.system_state_handler.clone(),
                                 waker: WakerBarrier(cx.waker().clone(), wait_barrier),
                             },
-                        ) {
-                            Ok(_) => {}
-                            // This should never panic because we never `close` our concurrent queues and
-                            // the concurrent queue here is unbounded.
-                            Err(_) => unreachable!(),
-                        }
-                    }
-                    FutureState::Uninitialized => {
-                        println!("sending uninitalized");
-                        match global_wake_registry.0.try_send(
-                            &self.3,
+                        )
+                        .ok(),
+                    FutureState::Uninitialized => global_wake_registry
+                        .0
+                        .try_send(
+                            &self.world_id_schedule,
                             Uninitialized {
-                                system_state_handler: self.5.clone(),
+                                system_state_handler: self.system_state_handler.clone(),
                                 waker: WakerBarrier(cx.waker().clone(), wait_barrier),
                             },
-                        ) {
-                            Ok(_) => {}
-                            // This should never panic because we never `close` our concurrent queues and
-                            // the concurrent queue here is unbounded.
-                            Err(_) => unreachable!(),
-                        }
-                        self.6 = FutureState::Initialized;
-                    }
+                        )
+                        .ok(),
                 }
+                .unwrap();
+                // The above should never panic because we never `close` our concurrent queues and
+                // the concurrent queue here is unbounded.
                 Poll::Pending
             }
         }
