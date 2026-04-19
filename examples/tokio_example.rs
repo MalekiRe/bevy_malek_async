@@ -1,18 +1,20 @@
 use bevy::prelude::*;
-use bevy_ecs::world::WorldId;
-use bevy_malek_async::{AsyncEcsPlugin, CreateEcsTask};
+use bevy_malek_async::{AsyncPlugin, AsyncWorld, async_world_sync_point};
 
 fn main() {
     App::new()
         // Keep Bevy minimal to avoid extra overhead
         .add_plugins(MinimalPlugins)
         .init_resource::<MyResource>()
-        .add_plugins(AsyncEcsPlugin)
+        .add_plugins(AsyncPlugin::default())
         // Spawn the Tokio web request from a Startup system
         .add_systems(Startup, spawn_tokio_web_request)
         .add_systems(Update, print_resource)
+        .add_systems(Update, async_world_sync_point::<MySyncPoint>)
         .run();
 }
+
+struct MySyncPoint;
 
 fn print_resource(mut last: Local<String>, res: ResMut<MyResource>) {
     if last.as_str() != res.0.as_str() {
@@ -21,9 +23,9 @@ fn print_resource(mut last: Local<String>, res: ResMut<MyResource>) {
     }
 }
 
-fn spawn_tokio_web_request(world_id: WorldId) {
+fn spawn_tokio_web_request(async_world: Res<AsyncWorld>) {
     println!("Starting Tokio web request in background task...");
-
+    let async_world = async_world.clone();
     // Run the async task on its own OS thread with a dedicated Tokio runtime
     // so it doesn't require any global/runtime integration with Bevy.
     let _handle = std::thread::Builder::new()
@@ -35,7 +37,7 @@ fn spawn_tokio_web_request(world_id: WorldId) {
                 .expect("create tokio runtime");
 
             rt.block_on(async move {
-                if let Err(err) = fetch_example_com(world_id).await {
+                if let Err(err) = fetch_example_com(async_world).await {
                     eprintln!("HTTP task error: {err}");
                 }
             });
@@ -44,7 +46,7 @@ fn spawn_tokio_web_request(world_id: WorldId) {
 }
 
 async fn fetch_example_com(
-    world_id: WorldId,
+    async_world: AsyncWorld,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::builder()
         .user_agent("bevy-tokio-example/0.1")
@@ -54,12 +56,12 @@ async fn fetch_example_com(
     let status = resp.status();
     let body = resp.text().await?;
     println!("Fetched google.com: status={status}, bytes={}", body.len());
-    world_id
-        .ecs_task::<ResMut<MyResource>>()
-        .run_system(Update, |mut my_resource| {
+    async_world
+        .system_state::<ResMut<MyResource>>()
+        .bridge(MySyncPoint, |mut my_resource| {
             my_resource.0 = body;
         })
-        .await;
+        .await?;
 
     Ok(())
 }

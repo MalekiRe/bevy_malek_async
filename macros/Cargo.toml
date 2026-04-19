@@ -1,0 +1,18 @@
+[package]
+name = "bevy_malek_async_macros"
+version = "0.1.0"
+edition = "2024"
+description = "Derive implementations for bevy_scene with some async stuff"
+repository = "https://github.com/MalekiRe/bevy_malek_async"
+license = "MIT OR Apache-2.0"
+keywords = ["bevy"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+bevy_macro_utils = { git = "https://github.com/bevyengine/bevy", version = "0.19.0-dev" }
+
+syn = { version = "2.0", features = ["full", "extra-traits"] }
+proc-macro2 = "1.0"
+quote = "1.0"

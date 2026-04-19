@@ -1,595 +1,231 @@
-use crate::keyed_queues::KeyedQueues;
-use bevy_ecs::{
-    change_detection::Tick,
-    error::ErrorContext,
-    prelude::NonSend,
-    schedule::{InternedScheduleLabel, ScheduleLabel},
-    system::{SystemParam, SystemParamValidationError, SystemState},
-    world::{World, WorldId, unsafe_world_cell::UnsafeWorldCell},
-};
-use bevy_platform::{
-    collections::HashMap,
-    sync::{Arc, Mutex, OnceLock, RwLock, atomic::*},
-};
-use concurrent_queue::ConcurrentQueue;
-use core::{
-    marker::PhantomData,
-    pin::Pin,
-    any::Any,
-    task::{Context, Poll, Waker},
-};
-use std::sync::Condvar;
+//! The objective here is to coordinate two participants that want to share World access:
+//!
+//! - The main Bevy schedule
+//! - Futures and async tasks running on other threads
+//!
+//! This is done through the bridge primitive introduced in this crate
+//!
+//!
+//! Invariants of this crate:
+//!
+//! - Normal rust safety invariants for &mut World (aliasing)
+//! - At most one future has world access at a time
+//! - Futures only access the world while the scoped pointer (managed by the bridge driver) is live
+//! - `SystemState` is always initialized before use
+//! - Deferred ops are only applied after every future finishes polling and releases world access
+//! - The driver can't deadlock
+//! - All futures that want world access can eventually complete (assuming fair scheduling by the async runtime)
+//! - If the world is dropped, futures don't leak and eventually finish (in an error state)
+//!
+//!
+//! The protocol:
+//!
+//! Futures (tasks on worker threads)
+//! - enqueue requests (create signal guard clones: one kept, one sent)
+//!
+//! - Driver([`async_world_sync_point`]) (exclusive system, world-owning thread)
+//!   1. Drain request queue for this sync point
+//!   2. Publish World pointer (via `scoped_static_storage`). Future access scope begins
+//!   3. Wake all drained futures
+//!
+//!  -> Futures race for locks (non-blocking)
+//!
+//!  -> Success: acquire both locks, do work, complete
+//!
+//!  -> Failure: signal driver (Drop signal guard), re-enqueue later
+//!
+//!  -> Direct access: non-queued future polled during scope,
+//!  bypasses queue, acquires locks, completes (no signal)
+//!   4. Wait for all signal guards to drop + scope mutex released
+//!   5. Unpublish pointer, scope ends.
+//!   6. Apply any deferred ops from `SystemState` of polled futures
+//!   7. Loop (up to [`AsyncTickBudget`]) or return
+//!   8. Schedule resumes (normal systems run)
+//!
+//!
+//! Dual locking:
+//!
+//! The published World pointer lock is managed by the `ScopedStatic` primitive in `scoped_static_storage` (only one future can lock this at a time)
+//! `SystemState` locks are managed by the `SystemStateCell` primitive of this crate (futures using different `SystemState` types can work in parallel)
+//!
+//!
+//! Preventing driver deadlocks when futures panic:
+//!
+//! If a future panics while holding locks, rust's panic unwinding drops destructors in reverse scope order
+//! - First, the `SystemState` `MutexGuard` drops (releasing the lock)
+//! - Second, the World pointer's scope `MutexGuard` drops (releasing the lock)
+//! - Finally, the guard signal constructed by the future during `poll()` drops, and the driver is notified
+//!
+//! How futures can fail cleanly:
+//!
+//! If the [`AsyncWorld`] cannot be reached ([`bevy_platform::sync::Weak::upgrade`] fails during `poll()`), the world has been dropped and the future cannot complete.
+//!
+//! If `SystemState`s are invalid, they can't be used and the future cannot complete
+//!
+//! Regardless, the future returns Ready(Err) and completes permanently
+#![forbid(unsafe_code)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![doc(
+    html_logo_url = "https://!bevy.org/assets/icon.png",
+    html_favicon_url = "https://!bevy.org/assets/icon.png"
+)]
+#![no_std]
 
-pub struct AsyncEcsPlugin;
+#[cfg(feature = "std")]
+extern crate std;
 
-#[derive(Clone)]
-struct MyBarrier(Arc<(Mutex<bool>, Condvar)>);
-impl MyBarrier {
-    pub fn new() -> Self {
-        MyBarrier(Arc::new((Mutex::new(false), Condvar::new())))
-    }
-    pub fn wait(&self) {
-        let (lock, cv) = &*self.0;
-        let mut signaled = lock.lock().unwrap();
+pub mod async_ui;
+mod bridge_future;
+mod bridge_request;
+mod plugin;
+mod system_state;
+mod wake_signal;
 
-        while !*signaled {
-            signaled = cv.wait(signaled).unwrap();
-        }
+pub use crate::bridge_future::{AsyncSystemState, BridgeError};
+pub use crate::bridge_request::async_world_sync_point;
+pub use crate::plugin::{AsyncPlugin, AsyncTickBudget, AsyncWorld};
 
-        // Optional: auto-reset after one waiter passes through.
-        //*signaled = false;
-    }
-}
-impl Drop for MyBarrier {
-    fn drop(&mut self) {
-        let (lock, cv) = &*self.0;
-        let mut signaled = lock.lock().unwrap();
-        *signaled = true;
-        cv.notify_one();
-    }
-}
-
-struct WakerBarrier(Waker, MyBarrier);
-
-impl bevy_app::Plugin for AsyncEcsPlugin {
-    fn build(&self, app: &mut bevy_app::App) {
-        use bevy_app::prelude::{
-            First, FixedFirst, FixedLast, FixedPostUpdate, FixedPreUpdate, FixedUpdate, Last,
-            PostStartup, PostUpdate, PreStartup, PreUpdate, Startup, Update,
-        };
-        for awa in vec![
-            PreStartup.intern(),
-            Startup.intern(),
-            PostStartup.intern(),
-            PreUpdate.intern(),
-            Update.intern(),
-            PostUpdate.intern(),
-            FixedPostUpdate.intern(),
-            FixedPreUpdate.intern(),
-            FixedUpdate.intern(),
-            First.intern(),
-            Last.intern(),
-            FixedFirst.intern(),
-            FixedLast.intern(),
-        ] {
-            app.add_systems(awa, move |world: &mut World| {
-                run_async_ecs_on_schedule(awa, world);
-            });
-        }
-    }
-}
-
-pub fn run_async_ecs_on_schedule(schedule: InternedScheduleLabel, world: &mut World) {
-    GLOBAL_WAKE_REGISTRY.wait(schedule, world);
-}
-
-/// Keyed queues is a combination of a hashmap and a concurrent queue which is useful because it
-/// allows for non-blocking keyed queues.
-/// We want every World's async machinery to be as independent as possible, and this allows us
-/// to key our Queues on `(WorldId, Schedule)` so that there is 0 contention on the fast path and
-/// arbitrary N number of worlds running in parallel on the same process do not interfere at all
-/// except the very first time a new world initializes it's key.
-mod keyed_queues {
-    use bevy_platform::collections::HashMap;
-    use bevy_platform::sync::{Arc, RwLock};
-    use concurrent_queue::ConcurrentQueue;
-    use core::hash::Hash;
-    /// `HashMap<K, Arc<ConcurrentQueue<V>>>` behind a single `RwLock`.
-    /// - Writers only contend when creating a new key.
-    /// - `push` is almost always non-blocking (unbounded queue).
-    pub struct KeyedQueues<K, V> {
-        inner: RwLock<HashMap<K, Arc<ConcurrentQueue<V>>>>,
-    }
-
-    impl<K, V> KeyedQueues<K, V>
-    where
-        K: Eq + Hash + Clone,
-        V: Send + 'static,
-    {
-        pub fn new() -> Self {
-            Self {
-                inner: RwLock::new(HashMap::new()),
-            }
-        }
-
-        #[inline]
-        pub fn get_or_create(&self, key: &K) -> Arc<ConcurrentQueue<V>> {
-            // Fast path: try read lock first
-            if let Some(q) = self.inner.read().unwrap().get(key).cloned() {
-                return q;
-            }
-            // Slow path: create under write lock if still absent
-            let mut write = self.inner.write().unwrap();
-            // We intentionally check a second time because of synchronization
-            if let Some(q) = write.get(key).cloned() {
-                return q;
-            }
-            let q = Arc::new(ConcurrentQueue::unbounded());
-            write.insert(key.clone(), q.clone());
-            q
-        }
-
-        /// Potentially-blocking send but almost never blocking (unbounded queue => `push` never fails).
-        /// ( Only blocks when the `(WorldId, Schedule)` has never been used before
-        #[inline]
-        pub fn try_send(&self, key: &K, val: V) -> Result<(), concurrent_queue::PushError<V>> {
-            let q = self.get_or_create(key);
-            q.push(val)
-        }
-    }
+/// The async prelude.
+///
+/// This includes the most common types in this crate, re-exported for your convenience.
+pub mod prelude {
+    #[doc(hidden)]
+    pub use crate::{
+        AsyncPlugin, AsyncSystemState, AsyncTickBudget, AsyncWorld, BridgeError,
+        async_world_sync_point,
+    };
 }
 
-/// This is an abstraction that temporarily and soundly stores the `UnsafeWorldCell` in a static so we can access
-/// it from any async task, runtime, and thread.
-static GLOBAL_WORLD_ACCESS: WorldAccessRegistry = WorldAccessRegistry(OnceLock::new());
+#[cfg(test)]
+mod tests {
+    use crate::prelude::*;
+    use bevy_app::ScheduleRunnerPlugin;
+    use bevy_app::prelude::*;
+    use bevy_ecs::prelude::*;
+    use bevy_platform::sync::atomic::AtomicBool;
+    use bevy_platform::sync::atomic::Ordering;
+    use bevy_tasks::AsyncComputeTaskPool;
 
-/// The entrypoint, stores `Waker`s from `async_access`'s that wish to be polled with world access
-/// also stores the generic function pointer to the concrete function that initializes the
-/// system state for any set of `SystemParams`
-pub(crate) static GLOBAL_WAKE_REGISTRY: WakeRegistry = WakeRegistry(OnceLock::new());
+    /// This tests that if a world is dropped we return an error from attempting to run it and
+    /// that everything cleans up nicely
+    /// Because of a quirk of how bevy's task pools work we have to always have at least one
+    /// active world for anything to progress on them.
+    /// That's what `other_app` is for.
+    #[test]
+    fn dropped_world() {
+        struct MySyncPoint;
+        static WORLD_WAS_DROPPED: AtomicBool = AtomicBool::new(false);
+        let mut other_app = App::new();
+        other_app.add_plugins((TaskPoolPlugin::default(), ScheduleRunnerPlugin::default()));
+        let mut app = App::new();
+        app.add_plugins((
+            AsyncPlugin::default(),
+            ScheduleRunnerPlugin::default(),
+            TaskPoolPlugin::default(),
+        ));
 
-/// Is the `GLOBAL_WAKE_REGISTRY`
-pub(crate) struct WakeRegistry(
-    OnceLock<(
-        KeyedQueues<(WorldId, InternedScheduleLabel), Uninitialized>,
-        KeyedQueues<(WorldId, InternedScheduleLabel), ReadyToWake>,
-    )>,
-);
-
-impl WakeRegistry {
-    /// This function finds all pending `async_access` calls for a particular `Schedule` and a particular
-    /// `WorldId`. It wakes all of them, temporarily and soundly stores a `UnsafeWorldCell` in the
-    /// `GLOBAL_WORLD_ACCESS` and parks until the tasks it has awoken either complete their `async_access`
-    /// or have returned `Poll::Pending` for a variety of reasons.
-    /// The performance implications of this call are entirely dependent on the async runtime
-    /// you are using it with, certain poor implementations *could* cause this to take longer
-    /// than expect to resolve.
-    /// Returns `Some` as long as the last call processed any number of waiting `async_access` calls.
-    pub fn wait(&self, schedule: InternedScheduleLabel, world: &mut World) -> Option<()> {
-        let world_id = world.id();
-        let global_wake_registry = GLOBAL_WAKE_REGISTRY
-            .0
-            .get_or_init(|| (KeyedQueues::new(), KeyedQueues::new()));
-        if global_wake_registry
-            .0
-            .get_or_create(&(world_id, schedule))
-            .is_empty()
-            && global_wake_registry
-                .1
-                .get_or_create(&(world_id, schedule))
-                .is_empty()
-        {
-            return None;
-        }
-        let mut ecs_tasks = bevy_platform::prelude::vec![];
-        while let Ok(ecs_task) = global_wake_registry
-            .0
-            .get_or_create(&(world_id, schedule))
-            .pop()
-        {
-            ecs_tasks.push(ecs_task.initialize(world))
-        }
-        while let Ok(ecs_task) = global_wake_registry
-            .1
-            .get_or_create(&(world_id, schedule))
-            .pop()
-        {
-            ecs_tasks.push(ecs_task)
-        }
-        let mut need_to_apply_system_state = None;
-        GLOBAL_WORLD_ACCESS.set(world, || {
-            let ecs_tasks = wait_for_async_tasks(ecs_tasks);
-            need_to_apply_system_state = Some(ecs_tasks);
-        })?;
-        // Applies all the commands stored up to the world and other system state
-        for task in need_to_apply_system_state? {
-            task.apply_system_params(world);
-        }
-        Some(())
-    }
-}
-
-struct Uninitialized {
-    system_state_handler: Arc<dyn SystemStateHandler>,
-    waker: WakerBarrier,
-}
-
-struct ReadyToWake {
-    system_state_handler: Arc<dyn SystemStateHandler>,
-    waker: WakerBarrier,
-}
-
-struct Awoken {
-    system_state_handler: Arc<dyn SystemStateHandler>,
-    barrier: MyBarrier,
-}
-
-struct NeedToApplySystemState {
-    system_state_handler: Arc<dyn SystemStateHandler>,
-}
-
-impl Uninitialized {
-    fn initialize(self, world: &mut World) -> ReadyToWake {
-        self.system_state_handler.system_init(world);
-        let Self {
-            system_state_handler,
-            waker,
-        } = self;
-        ReadyToWake {
-            system_state_handler,
-            waker,
-        }
-    }
-}
-
-impl NeedToApplySystemState {
-    fn apply_system_params(self, world: &mut World) {
-        self.system_state_handler.system_apply(world);
-    }
-}
-
-pub fn wait_for_async_tasks(ecs_tasks: Vec<ReadyToWake>) -> Vec<NeedToApplySystemState> {
-    let ecs_tasks = ecs_tasks
-        .into_iter()
-        .map(
-            |ReadyToWake {
-                 system_state_handler,
-                 waker,
-             }| {
-                waker.0.wake();
-                Awoken {
-                    system_state_handler,
-                    barrier: waker.1,
-                }
-            },
-        )
-        // we re-collect to ensure we fully exhaust the prior iterator
-        // we want to have all the wakers call .wake() before the first barrier calls .wait()
-        .collect::<Vec<_>>();
-    bevy_tasks::tick_global_task_pools_on_main_thread();
-    ecs_tasks
-        .into_iter()
-        .map(
-            |Awoken {
-                 system_state_handler,
-                 barrier,
-             }| {
-                barrier.wait();
-                NeedToApplySystemState {
-                    system_state_handler,
-                }
-            },
-        )
-        .collect()
-}
-
-// We have a couple of transitions
-// We have acquirin
-
-/// This is a very low contention, no contention in the normal execution path, way of storing and
-/// using a `UnsafeWorldCell` from any thread/async task/async runtime.
-/// The `Mutex<PhantomData<>>` is used to return `Poll::Pending` early from an `async_access` if
-/// another `async_access` is currently using it.
-pub(crate) struct WorldAccessRegistry(
-    OnceLock<
-        RwLock<
-            HashMap<
-                WorldId,
-                RwLock<
-                    Option<(
-                        UnsafeWorldCell<'static>,
-                        Mutex<PhantomData<UnsafeWorldCell<'static>>>,
-                    )>,
-                >,
-            >,
-        >,
-    >,
-);
-
-impl WorldAccessRegistry {
-    /// During this `func: FnOnce()` call, calling `get` will access the stored `UnsafeWorldCell`
-    fn set(&self, world: &mut World, func: impl FnOnce()) -> Option<()> {
-        let this = self.0.get_or_init(|| RwLock::new(HashMap::new()));
-        let world_id = world.id();
-        if !this.read().unwrap().contains_key(&world_id) {
-            // VERY rare only happens the first time we try to do anything async in a new World
-            let _ = this.write().unwrap().insert(world_id, RwLock::new(None));
-        }
-
-        struct ClearOnDropGuard<'a> {
-            slot: &'a RwLock<
-                Option<(
-                    UnsafeWorldCell<'static>,
-                    Mutex<PhantomData<UnsafeWorldCell<'static>>>,
-                )>,
-            >,
-        }
-        impl<'a> Drop for ClearOnDropGuard<'a> {
-            fn drop(&mut self) {
-                // clear it on the way out
-                // we can't actually panic here because panicking in a drop is bad
-                match self.slot.write() {
-                    Ok(mut slot) => {
-                        let _ = slot.take();
+        app.add_systems(Startup, move |world: Res<AsyncWorld>| {
+            let world = world.clone();
+            AsyncComputeTaskPool::get()
+                .spawn(async move {
+                    let system_state = world.system_state::<Commands>();
+                    match system_state
+                        .bridge(MySyncPoint, |mut commands: Commands| {
+                            commands.spawn_empty();
+                        })
+                        .await
+                    {
+                        Err(BridgeError::WorldDropped) => {
+                            WORLD_WAS_DROPPED.store(true, Ordering::Relaxed);
+                        }
+                        _ => unreachable!("World should have Dropped"),
                     }
-                    Err(_) => {
-                        // This is okay because the mutex is poisoned so nothing can access the
-                        // UnsafeWorldCell now.
+                })
+                .detach();
+        });
+        app.update();
+        drop(app);
+        other_app.update();
+        assert!(WORLD_WAS_DROPPED.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn invalid_parameters() {
+        struct MySyncPoint;
+        static FAILED_VALIDATION: AtomicBool = AtomicBool::new(false);
+
+        #[derive(Resource)]
+        struct MyResource;
+
+        let mut app = App::new();
+        app.add_plugins((
+            AsyncPlugin::default(),
+            ScheduleRunnerPlugin::default(),
+            TaskPoolPlugin::default(),
+        ));
+
+        app.add_systems(Update, async_world_sync_point::<MySyncPoint>);
+
+        app.add_systems(Startup, move |world: Res<AsyncWorld>| {
+            let world = world.clone();
+            AsyncComputeTaskPool::get()
+                .spawn(async move {
+                    let system_state = world.system_state::<Res<MyResource>>();
+                    match system_state.bridge(MySyncPoint, |_| unreachable!()).await {
+                        Err(BridgeError::SystemParamValidation(_)) => {
+                            FAILED_VALIDATION.store(true, Ordering::Relaxed);
+                        }
+                        _ => unreachable!("Parameter validation should have failed"),
                     }
-                }
-            }
-        }
-        // SAFETY: This mem transmute is safe only because we drop it after, and our GLOBAL_WORLD_ACCESS is private, and we don't clone it
-        // where we do use it, so the lifetime doesn't get propagated anywhere.
-        // Lifetimes are not used in any actual code optimization, so turning it into a static does not violate any of rust's rules
-        // As *LONG* as we keep it within it's lifetime, which we do here, manually, with our `ClearOnDrop` struct.
-        unsafe {
-            let binding = this.read().unwrap();
-            let world_container = binding.get(&world_id).unwrap();
-            // SAFETY this is required in order to make sure that even in the event of a panic, this can't get accessed
-            let _clear = ClearOnDropGuard {
-                slot: world_container,
-            };
-            // SAFETY: This mem transmute is safe only because we drop it after, and our GLOBAL_WORLD_ACCESS is private, and we don't clone it
-            // where we do use it, so the lifetime doesn't get propagated anywhere.
-            // Lifetimes are not used in any actual code optimization, so turning it into a static does not violate any of rust's rules
-            // As *LONG* as we keep it within it's lifetime, which we do here, manually, with our `ClearOnDrop` struct.
-            world_container.write().unwrap().replace((
-                core::mem::transmute::<UnsafeWorldCell, UnsafeWorldCell<'static>>(
-                    world.as_unsafe_world_cell(),
-                ),
-                Mutex::new(PhantomData),
-            ));
-            func();
-        }
-        Some(())
-    }
-    fn get<T>(
-        &self,
-        world_id: WorldId,
-        func: impl FnOnce(UnsafeWorldCell) -> Poll<T>,
-    ) -> Option<Poll<T>> {
-        // it's okay to *not* do the RaiiThing on these early returns, because that means we aren't in a state
-        // where a thread is parked because of our world.
-        let a = self.0.get()?.read().unwrap();
-        let b = a.get(&world_id)?.read().unwrap();
-        let our_thing = b.as_ref()?;
+                })
+                .detach();
+        });
 
-        // this allows us to effectively yield as if pending if the world doesn't exist rn.
-        let _world = our_thing.1.try_lock().ok()?;
-        // SAFETY: this is safe because we ensure no one else has access to the world.
-        Some(func(our_thing.0))
-    }
-}
+        app.update();
 
-impl<P: bevy_ecs::system::SystemParam + 'static> EcsTask<P> {
-    /// Allows you to access the ECS from any arbitrary async runtime.
-    pub async fn run_system<Func, Out>(&self, schedule: impl ScheduleLabel, ecs_access: Func) -> Out
-    where
-        for<'w, 's> Func: FnOnce(P::Item<'w, 's>) -> Out,
-    {
-        PendingEcsCall::<P, Func, Out> {
-            phantom_data: Default::default(),
-            ecs_func: Some(ecs_access),
-            world_id_schedule: (self.world_id, schedule.intern()),
-            barrier: None,
-            system_state_handler: self.system_state_handler.clone(),
-        }
-        .await
-    }
-}
-
-pub trait CreateEcsTask {
-    fn ecs_task<P: SystemParam + 'static>(self) -> EcsTask<P>;
-}
-
-impl CreateEcsTask for WorldId {
-    fn ecs_task<P: SystemParam + 'static>(self) -> EcsTask<P> {
-        EcsTask {
-            phantom_data: Default::default(),
-            world_id: self,
-            system_state_handler: Arc::new(SystemStateHandlerStruct::<P>(
-                ConcurrentQueue::bounded(1),
-                AtomicBool::new(false),
-            )),
-        }
-    }
-}
-
-#[derive(PartialOrd, PartialEq, Eq, Ord, Hash, Debug, Copy, Clone)]
-enum FutureState {
-    Initialized,
-    Uninitialized,
-}
-
-struct PendingEcsCall<P: SystemParam + 'static, Func, Out> {
-    phantom_data: PhantomData<(P, Out)>,
-    ecs_func: Option<Func>,
-    world_id_schedule: (WorldId, InternedScheduleLabel),
-    barrier: Option<MyBarrier>,
-    system_state_handler: Arc<dyn SystemStateHandler>,
-}
-
-/// An `EcsTask` can be re-used in order to persist `SystemParams` like `Local`, `Changed`, or `Added`
-pub struct EcsTask<P: SystemParam + 'static> {
-    phantom_data: PhantomData<P>,
-    world_id: WorldId,
-    system_state_handler: Arc<dyn SystemStateHandler>,
-}
-
-trait SystemStateHandler: Send + Sync {
-    fn system_init(&self, world: &mut World);
-
-    fn system_apply(&self, world: &mut World);
-
-    fn as_any(&self) -> &dyn Any;
-
-    fn future_state(&self) -> FutureState;
-}
-
-struct SystemStateHandlerStruct<P: SystemParam + 'static>(
-    pub ConcurrentQueue<SystemState<P>>,
-    AtomicBool,
-);
-
-impl<P: SystemParam + 'static> SystemStateHandler for SystemStateHandlerStruct<P> {
-    fn system_init(&self, world: &mut World) {
-        match self.0.push(SystemState::<P>::new(world)) {
-            Ok(_) => {}
-            Err(_) => panic!(),
-        }
-        self.1.store(true, Ordering::Relaxed);
-    }
-    fn system_apply(&self, world: &mut World) {
-        let Ok(mut system_state) = self.0.pop() else {
-            panic!()
-        };
-        system_state.apply(world);
-        match self.0.push(system_state) {
-            Ok(_) => {}
-            Err(_) => panic!(),
-        }
+        assert!(FAILED_VALIDATION.load(Ordering::Relaxed));
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self as &dyn Any
-    }
+    #[test]
+    #[cfg(not(feature = "std"))]
+    fn no_std_test() {
+        use crate::prelude::*;
+        use bevy_app::ScheduleRunnerPlugin;
+        use bevy_app::prelude::*;
+        use bevy_ecs::prelude::*;
+        use bevy_platform::sync::atomic::AtomicBool;
+        use bevy_platform::sync::atomic::Ordering;
+        use bevy_tasks::AsyncComputeTaskPool;
 
-    fn future_state(&self) -> FutureState {
-        match self.1.load(Ordering::Relaxed) {
-            true => FutureState::Initialized,
-            false => FutureState::Uninitialized,
-        }
-    }
-}
+        struct MySyncPoint;
+        static ACCESS_RAN: AtomicBool = AtomicBool::new(false);
+        let mut app = App::new();
+        app.add_plugins((
+            AsyncPlugin::default(),
+            ScheduleRunnerPlugin::default(),
+            TaskPoolPlugin::default(),
+        ));
 
-impl<P: SystemParam + 'static, Func, Out> Unpin for PendingEcsCall<P, Func, Out> {}
+        app.add_systems(Update, async_world_sync_point::<MySyncPoint>);
 
-impl<P, Func, Out> Future for PendingEcsCall<P, Func, Out>
-where
-    P: SystemParam + 'static,
-    for<'w, 's> Func: FnOnce(P::Item<'w, 's>) -> Out,
-{
-    type Output = Out;
+        app.add_systems(Startup, move |world: Res<AsyncWorld>| {
+            let world = world.clone();
+            AsyncComputeTaskPool::get()
+                .spawn_local(async move {
+                    let system_state = world.system_state::<Commands>();
+                    system_state
+                        .bridge(MySyncPoint, |mut commands: Commands| {
+                            commands.spawn_empty();
+                            ACCESS_RAN.store(true, Ordering::Relaxed);
+                        })
+                        .await
+                        .unwrap();
+                })
+                .detach();
+        });
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let world_id = self.world_id_schedule.0;
+        app.update();
 
-        match GLOBAL_WORLD_ACCESS.get(world_id, |world: UnsafeWorldCell| {
-            // SAFETY: We have a fake-mutex around our world, so no one else can do mutable access to it.
-            let Ok(mut system_state) = self
-                .system_state_handler
-                .as_any()
-                .downcast_ref::<SystemStateHandlerStruct<P>>()
-                .unwrap()
-                .0
-                .pop()
-            else {
-                return Poll::Pending;
-            };
-            let out;
-            // SAFETY: This is safe because we have a fake-mutex around our world cell, so only one thing can have access to it at a time.
-            unsafe {
-                let default_error_handler = world.default_error_handler();
-                // Obtain params and immediately consume them with the closure,
-                // ensuring the borrow ends before `apply`.
-                if let Err(err) = SystemState::validate_param(&mut system_state, world) {
-                    default_error_handler(
-                        err.into(),
-                        ErrorContext::System {
-                        name: system_state.meta().name().clone(),
-                        last_run: /*system_state.meta().last_run*/ Tick::new(0),
-                    },
-                    );
-                }
-                if !system_state.meta().is_send() {
-                    default_error_handler(
-                        SystemParamValidationError::invalid::<NonSend<()>>(
-                            "Cannot have your system be non-send / exclusive",
-                        )
-                        .into(),
-                        ErrorContext::System {
-                        name: system_state.meta().name().clone(),
-                        last_run: /*system_state.meta.last_run */Tick::new(0),
-                    },
-                    );
-                }
-                let state = system_state.get_unchecked(world);
-                out = self.as_mut().ecs_func.take().unwrap()(state);
-            }
-            match self
-                .system_state_handler
-                .as_any()
-                .downcast_ref::<SystemStateHandlerStruct<P>>()
-                .unwrap()
-                .0
-                .push(system_state)
-            {
-                Ok(_) => {}
-                Err(_) => panic!(),
-            }
-            self.barrier.take();
-            //self.4.disconnect();
-            Poll::Ready(out)
-        }) {
-            Some(Poll::Ready(out)) => Poll::Ready(out),
-            _ => {
-                // This must be a static, sadly, because we must always make sure that we can store
-                // our pending wakers no matter what. Everything else that we care about can be
-                // stored on the world itself, but this must always be accessible, even if another
-                // `async_access` is currently running.
-                let global_wake_registry = GLOBAL_WAKE_REGISTRY
-                    .0
-                    .get_or_init(|| (KeyedQueues::new(), KeyedQueues::new()));
-                let wait_barrier = MyBarrier::new();
-                self.barrier.replace(wait_barrier.clone());
-                match self.system_state_handler.future_state() {
-                    FutureState::Initialized => global_wake_registry
-                        .1
-                        .try_send(
-                            &self.world_id_schedule,
-                            ReadyToWake {
-                                system_state_handler: self.system_state_handler.clone(),
-                                waker: WakerBarrier(cx.waker().clone(), wait_barrier),
-                            },
-                        )
-                        .ok(),
-                    FutureState::Uninitialized => global_wake_registry
-                        .0
-                        .try_send(
-                            &self.world_id_schedule,
-                            Uninitialized {
-                                system_state_handler: self.system_state_handler.clone(),
-                                waker: WakerBarrier(cx.waker().clone(), wait_barrier),
-                            },
-                        )
-                        .ok(),
-                }
-                .unwrap();
-                // The above should never panic because we never `close` our concurrent queues and
-                // the concurrent queue here is unbounded.
-                Poll::Pending
-            }
-        }
+        assert!(ACCESS_RAN.load(Ordering::Relaxed));
     }
 }
