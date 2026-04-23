@@ -42,13 +42,13 @@ impl Plugin for AsyncUiPlugin {
 
 #[derive(Resource, Clone)]
 pub struct Ctx {
-    async_world: AsyncWorld,
+    pub(crate) async_world: AsyncWorld,
     observer_cache: Arc<RwLock<HashMap<(Entity, TypeId), Box<dyn Any + Send + Sync + 'static>>>>,
     system_cache: Arc<RwLock<HashMap<TypeId, Arc<dyn ErasedSystemStateCell>>>>,
 }
 
 impl Ctx {
-    pub fn cached<P: SystemParam + 'static>(&self) -> AsyncSystemState<P> {
+    pub fn cached_state<P: SystemParam + 'static>(&self) -> AsyncSystemState<P> {
         if let Some(system_state) = self.system_cache.read().unwrap().get(&TypeId::of::<P>()) {
             AsyncSystemState {
                 _p: PhantomData,
@@ -79,7 +79,7 @@ impl<T: AsyncFnMut(Ctx, Vec<Entity>) + Send + Sync + 'static + core::clone::Clon
     for AsyncClosureWrapper2<T>
 {
     fn resolve(
-        &self,
+        self,
         context: &mut ResolveContext,
         scene: &mut ResolvedScene,
     ) -> bevy_ecs::error::Result<(), ResolveSceneError> {
@@ -213,7 +213,7 @@ mod async_observers {
             &self,
             e: Entity,
         ) -> AsyncCloneObserver<E, B> {
-            let state = self.cached::<(Commands, Query<&AsyncCloneObserver<E, B>>)>();
+            let state = self.cached_state::<(Commands, Query<&AsyncCloneObserver<E, B>>)>();
             state
                 .bridge(AsyncUi, move |(mut commands, q)| {
                     if let Ok(async_observer) = q.get(e) {
@@ -246,7 +246,7 @@ mod async_observers {
                 .contains_key(&(e, TypeId::of::<AsyncCloneObserver<E, B>>()))
             {
                 async_observer = self
-                    .cached::<(Commands, Query<&AsyncCloneObserver<E, B>>)>()
+                    .cached_state::<(Commands, Query<&AsyncCloneObserver<E, B>>)>()
                     .bridge(AsyncUi, move |(mut commands, q)| {
                         if let Ok(async_observer) = q.get(e) {
                             return async_observer.clone();
@@ -289,7 +289,7 @@ mod async_observers {
             &self,
             e: Entity,
         ) -> AsyncObserver<E, B> {
-            let state = self.cached::<(Commands, Query<&AsyncObserver<E, B>>)>();
+            let state = self.cached_state::<(Commands, Query<&AsyncObserver<E, B>>)>();
             state
                 .bridge(AsyncUi, move |(mut commands, q)| {
                     if let Ok(async_observer) = q.get(e) {
@@ -314,7 +314,10 @@ mod async_observers {
                 .await
                 .unwrap()
         }
-        pub async fn on<E: EntityEvent, B: Bundle>(&self, e: Entity) {
+        pub async fn on<E: EntityEvent>(&self, e: Entity) {
+            self.on_with::<E, ()>(e).await
+        }
+        pub async fn on_with<E: EntityEvent, B: Bundle>(&self, e: Entity) {
             let async_observer;
             if !self
                 .observer_cache
@@ -323,7 +326,7 @@ mod async_observers {
                 .contains_key(&(e, TypeId::of::<AsyncObserver<E, B>>()))
             {
                 async_observer = self
-                    .cached::<(Commands, Query<&AsyncObserver<E, B>>)>()
+                    .cached_state::<(Commands, Query<&AsyncObserver<E, B>>)>()
                     .bridge(AsyncUi, move |(mut commands, q)| {
                         if let Ok(async_observer) = q.get(e) {
                             return async_observer.clone();

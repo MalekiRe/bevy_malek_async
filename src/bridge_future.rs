@@ -229,7 +229,7 @@ where
                         BridgeRequest {
                             waker: cx.waker().clone(),
                             wake_waiter,
-                            system_state: self.system_state.clone(),
+                            system_state: Some(self.system_state.clone()),
                             is_queued: self.is_queued.clone(),
                         },
                     )

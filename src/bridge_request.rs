@@ -138,26 +138,28 @@ pub(crate) struct BridgeRequest {
     /// Our custom primitive that lets us wait until all the futures have tried to run before
     /// continuing.
     pub(crate) wake_waiter: crate::wake_signal::WakeWaiter,
-    pub(crate) system_state: Arc<dyn ErasedSystemStateCell>,
+    pub(crate) system_state: Option<Arc<dyn ErasedSystemStateCell>>,
     pub(crate) is_queued: Arc<AtomicBool>,
 }
 
 /// A queued bridge request whose waker has already been fired.
 struct WokenBridgeRequest {
     wake_signal: crate::wake_signal::WakeWaiter,
-    system_state: Arc<dyn ErasedSystemStateCell>,
+    system_state: Option<Arc<dyn ErasedSystemStateCell>>,
     is_queued: Arc<AtomicBool>,
 }
 
 /// A request that has finished its attempted poll and may need to apply deferred world state.
 struct CompletedBridgeRequest {
-    system_state: Arc<dyn ErasedSystemStateCell>,
+    system_state: Option<Arc<dyn ErasedSystemStateCell>>,
 }
 
 impl CompletedBridgeRequest {
     #[inline]
     fn apply(self, world: &mut World) {
-        self.system_state.apply(world);
+        if let Some(system_state) = self.system_state {
+            system_state.apply(world);
+        }
     }
 }
 

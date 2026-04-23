@@ -71,8 +71,8 @@ fn todo_root() -> impl Scene {
         ThemeBackgroundColor(tokens::WINDOW_BG)
         async |world: Ctx| {
             loop {
-                 world.on::<Activate, ()>(#AddTodoButton).await;
-                 world.cached::<(Commands, Query<&EditableText>)>().bridge(AsyncUi, |(mut commands, texts)| {
+                 world.on::<Activate>(#AddTodoButton).await;
+                 world.cached_state::<(Commands, Query<&EditableText>)>().bridge(AsyncUi, |(mut commands, texts)| {
                     let text = texts.get(#TodoInput).unwrap().value().to_string();
                     let todo_list_root: Entity = #TodoListRoot;
                     let child =
@@ -93,22 +93,22 @@ fn todo_root() -> impl Scene {
                             (#Delete button(ButtonProps::default()) Text("Delete") ThemedText),
                         ]
                         async |world: Ctx| {
-                            world.on::<Activate, ()>(#Delete).await;
-                            world.cached::<Commands>().bridge(AsyncUi, |mut commands| {
+                            world.on::<Activate>(#Delete).await;
+                            world.cached_state::<Commands>().bridge(AsyncUi, |mut commands| {
                                 commands.entity(#This).despawn();
                             }).await.unwrap();
                         }
-                        async |world: Ctx| {
+                        async |ui: Ctx| {
                             loop {
-                                let value_change = world.on_cloned::<ValueChange<bool>, ()>(#Checkbox).await;
-                                world.cached::<Commands>().bridge(AsyncUi, |mut commands| {
+                                let value_change = ui.on_cloned::<ValueChange<bool>, ()>(#Checkbox).await;
+                                ui.bridge(|mut commands: Commands| {
                                     if value_change.value {
                                         commands.entity(#Checkbox).insert(Checked);
                                     } else {
                                         commands.entity(#Checkbox).remove::<Checked>();
                                     }
                                     commands.entity(todo_list_root).trigger(RefreshList);
-                                }).await.unwrap();
+                                }).await;
                             }
                         }
                     }).id();
@@ -120,19 +120,19 @@ fn todo_root() -> impl Scene {
             loop {
                 let filter_state;
                 futures::select! {
-                    _ = world.on::<Activate, ()>(#AllFilter).fuse() => {
+                    _ = world.on::<Activate>(#AllFilter).fuse() => {
                         filter_state = FilterState::All;
                     }
-                    _ = world.on::<Activate, ()>(#ActiveFilter).fuse() => {
+                    _ = world.on::<Activate>(#ActiveFilter).fuse() => {
                         filter_state = FilterState::Active;
                     }
-                    _ = world.on::<Activate, ()>(#CompletedFilter).fuse() => {
+                    _ = world.on::<Activate>(#CompletedFilter).fuse() => {
                         filter_state = FilterState::Completed;
                     }
                 }
-                world.cached::<Commands>().bridge(AsyncUi, |mut commands| {
+                world.bridge(|mut commands: Commands| {
                     commands.entity(#TodoListRoot).insert(filter_state).trigger(RefreshList);
-                }).await.unwrap();
+                }).await;
             }
         }
         Children [(
