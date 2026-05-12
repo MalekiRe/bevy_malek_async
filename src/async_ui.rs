@@ -1,20 +1,23 @@
+use crate::bridge_request::TickResult;
 use crate::system_state::ErasedSystemStateCell;
 use crate::{AsyncSystemState, AsyncWorld, async_world_sync_point};
 use async_channel::Sender;
 use bevy_app::{App, Plugin, PostUpdate};
+use bevy_ecs::component::{Component, ComponentId, ComponentMutability, Mutable};
 use bevy_ecs::entity::Entity;
 use bevy_ecs::lifecycle::HookContext;
-use bevy_ecs::prelude::Template;
-use bevy_ecs::system::SystemParam;
+use bevy_ecs::prelude::{Changed, Commands, Mut, Query, QueryState, Template, With, World};
+use bevy_ecs::query::QueryBuilder;
+use bevy_ecs::system::{Populated, SystemParam};
 use bevy_ecs::template::{ScopedEntities, ScopedEntityIndex, TemplateContext};
 use bevy_ecs::world::DeferredWorld;
-use bevy_ecs_macros::{Component, Resource};
+use bevy_ecs_macros::{EntityEvent, Resource};
 use bevy_scene::{ResolveContext, ResolveSceneError, ResolvedScene, Scene};
 use bevy_tasks::AsyncComputeTaskPool;
 use futures::FutureExt;
 use std::any::{Any, TypeId};
 use std::boxed::Box;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, RwLock};
 use std::vec;
@@ -32,6 +35,7 @@ impl Plugin for AsyncUiPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(PostUpdate, async_world_sync_point::<AsyncUi>);
         let async_world = app.world().resource::<AsyncWorld>().clone();
+        app.init_resource::<MutationTrackingRes>();
         app.insert_resource(Ctx {
             async_world,
             observer_cache: Arc::new(RwLock::new(HashMap::default())),
@@ -158,10 +162,9 @@ impl<T: Send + Sync + 'static> AsyncTaskThing<T> {
 }
 
 mod async_observers {
-    use crate::async_ui::{AsyncUi, Ctx};
+    use crate::async_ui::{AsyncUi, Ctx, MutationOccurred, MutationTracker};
     use bevy_ecs::observer::On;
-    use bevy_ecs::prelude::{Bundle, Commands, Entity, EntityEvent, Query};
-    use bevy_ecs_macros::Component;
+    use bevy_ecs::prelude::{Bundle, Commands, Component, Entity, EntityEvent, Query};
     use crossbeam::channel::{Receiver, Sender};
     use std::any::TypeId;
     use std::boxed::Box;
@@ -209,6 +212,22 @@ mod async_observers {
     }
 
     impl Ctx {
+        pub async fn on_mutation<C: Component<Mutability = bevy_ecs::component::Mutable>>(
+            &self,
+            e: Entity,
+        ) {
+            let state = self.cached_state::<(Commands, Query<&MutationTracker<C>>)>();
+            state
+                .bridge(AsyncUi, |(mut commands, query)| {
+                    if query.contains(e) {
+                        return;
+                    }
+                    commands.entity(e).insert(MutationTracker::<C>(PhantomData));
+                })
+                .await
+                .unwrap();
+            self.on::<MutationOccurred<C>>(e).await;
+        }
         pub async fn on_cloned_uncached<E: EntityEvent + Clone, B: Bundle>(
             &self,
             e: Entity,
@@ -408,4 +427,86 @@ mod async_observers {
             }
         }
     }
+}
+
+#[derive(Component)]
+#[require(MutationSender)]
+#[component(on_add)]
+#[component(on_remove)]
+pub struct MutationTracker<C: Component<Mutability = Mutable>>(PhantomData<C>);
+
+impl<C: Component<Mutability = Mutable>> MutationTracker<C> {
+    fn on_add(mut world: DeferredWorld, HookContext { entity, .. }: HookContext) {
+        let component_id = world.component_id::<C>().unwrap();
+        world
+            .entity_mut(entity)
+            .get_mut::<MutationSender>()
+            .unwrap()
+            .0
+            .insert(component_id, |entity: Entity, world: &mut World| {
+                world.trigger(MutationOccurred::<C> {
+                    entity,
+                    phantom: PhantomData,
+                });
+            });
+        world.commands().queue(move |world: &mut World| {
+            world
+                .resource_mut::<MutationTrackingRes>()
+                .0
+                .insert(component_id, |world| {
+                    world
+                        .run_system_cached(|query: Query<Entity, Changed<C>>| {
+                            query.iter().collect::<Vec<_>>()
+                        })
+                        .unwrap()
+                });
+        });
+    }
+    fn on_remove(mut world: DeferredWorld, HookContext { entity, .. }: HookContext) {
+        world.commands().queue(|world: &mut World| {
+            if world
+                .run_system_cached(|_mutation_tracker: Populated<&MutationTracker<C>>| {})
+                .is_err()
+            {
+                let component_id = world.component_id::<C>().unwrap();
+                world
+                    .resource_mut::<MutationTrackingRes>()
+                    .0
+                    .remove(&component_id);
+            }
+        })
+    }
+}
+
+#[derive(Resource, Default)]
+pub struct MutationTrackingRes(HashMap<ComponentId, fn(&mut World) -> Vec<Entity>>);
+
+#[derive(EntityEvent)]
+struct MutationOccurred<C: Component<Mutability = Mutable>> {
+    entity: Entity,
+    phantom: PhantomData<C>,
+}
+#[derive(Component, Default)]
+struct MutationSender(HashMap<ComponentId, fn(Entity, &mut World)>);
+
+pub fn pump_mutation_observers(world: &mut World) -> TickResult {
+    let mut tick_result = TickResult::NoWork;
+    world.resource_scope(
+        |world: &mut World, mut mutation_tracking_res: Mut<MutationTrackingRes>| {
+            for (component, query) in mutation_tracking_res.0.iter_mut() {
+                for item in query(world) {
+                    let awa = *world
+                        .entity(item)
+                        .get::<MutationSender>()
+                        .unwrap()
+                        .0
+                        .get(&component)
+                        .unwrap();
+                    awa(item, world);
+                    tick_result = TickResult::DidWork
+                }
+            }
+        },
+    );
+    tick_result
 }

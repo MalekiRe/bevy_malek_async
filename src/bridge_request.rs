@@ -1,3 +1,4 @@
+use crate::async_ui::pump_mutation_observers;
 use crate::plugin::{AsyncTickBudget, StrongAsyncWorld};
 use crate::system_state::ErasedSystemStateCell;
 use bevy_ecs::prelude::{IntoSystemSet, SystemSet, World};
@@ -62,7 +63,9 @@ pub fn async_world_sync_point<SyncPoint: 'static>(world: &mut World) {
             // Retry once after ticking the global pool. If we are still idle,
             // there is no more immediately available progress to make.
             if async_world.0.tick_sync_point(sync_point, world) == TickResult::NoWork {
-                return;
+                if pump_mutation_observers(world) == TickResult::NoWork {
+                    return;
+                }
             }
         }
     }
@@ -122,7 +125,7 @@ impl Drop for AsyncWorldInner {
 
 /// Whether a tick attempt made any progress.
 #[derive(PartialEq)]
-enum TickResult {
+pub(crate) enum TickResult {
     /// We found and processed at least one queued bridge request.
     DidWork,
     /// There was no queued work available for the `SyncPoint`.

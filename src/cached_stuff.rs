@@ -1,15 +1,15 @@
-use std::marker::PhantomData;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use crate::async_ui::{AsyncUi, Ctx};
+use crate::bridge_request::BridgeRequest;
+use crate::wake_signal::WakeSignaler;
+use crate::{AsyncWorld, BridgeError, bridge_request, cached_stuff, wake_signal};
 use bevy_ecs::prelude::{IntoSystemSet, SystemSet};
 use bevy_ecs::schedule::InternedSystemSet;
 use bevy_ecs::system::{SystemParam, SystemParamItem, SystemParamValidationError};
 use bevy_ecs::world::World;
-use crate::async_ui::{AsyncUi, Ctx};
-use crate::{bridge_request, cached_stuff, wake_signal, AsyncWorld, BridgeError};
-use crate::wake_signal::WakeSignaler;
 use bevy_platform::sync::atomic::Ordering;
-use crate::bridge_request::BridgeRequest;
+use std::marker::PhantomData;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 pub trait SystemParamFunction<Marker> {
     type Out;
@@ -18,15 +18,17 @@ pub trait SystemParamFunction<Marker> {
 }
 
 pub struct FunctionSystem<Marker, Out, F>
-where F: SystemParamFunction<Marker>
+where
+    F: SystemParamFunction<Marker>,
 {
     func: Option<F>,
-    marker: PhantomData<(Marker, Out)>
+    marker: PhantomData<(Marker, Out)>,
 }
 
 impl<Out, Func, F0: SystemParam + 'static> SystemParamFunction<fn(F0) -> Out> for Func
-    where Func: FnOnce(F0) -> Out + FnOnce(SystemParamItem<F0>) -> Out,
-    Out: 'static
+where
+    Func: FnOnce(F0) -> Out + FnOnce(SystemParamItem<F0>) -> Out,
+    Out: 'static,
 {
     type Out = Out;
     type Param = (F0,);
@@ -37,7 +39,7 @@ impl<Out, Func, F0: SystemParam + 'static> SystemParamFunction<fn(F0) -> Out> fo
         fn call_inner<Out, F0>(f: impl FnOnce(F0) -> Out, F0: F0) -> Out {
             f(F0)
         }
-        call_inner(self,f0)
+        call_inner(self, f0)
     }
 }
 
@@ -50,12 +52,15 @@ impl<Marker, Out, F> System for FunctionSystem<Marker, Out, F>
 where
     Marker: 'static,
     Out: 'static,
-    F: SystemParamFunction<Marker, Out = Out>
+    F: SystemParamFunction<Marker, Out = Out>,
 {
     type Out = Out;
     #[inline]
     fn run(&mut self, world: &mut World) -> Option<Result<Self::Out, SystemParamValidationError>> {
-        let state = world.resource::<Ctx>().cached_state::<F::Param>().system_state;
+        let state = world
+            .resource::<Ctx>()
+            .cached_state::<F::Param>()
+            .system_state;
         let mut state = state.try_lock::<F::Param>(world)?;
         let params = match state.get_mut(world) {
             Ok(params) => params,
@@ -86,7 +91,7 @@ impl<Marker, Out, F> IntoSystem<Out, (IsFunctionSystem, Marker)> for F
 where
     Marker: 'static,
     Out: 'static,
-    F: SystemParamFunction<Marker, Out = Out>
+    F: SystemParamFunction<Marker, Out = Out>,
 {
     type System = FunctionSystem<Marker, Out, F>;
 
@@ -101,25 +106,34 @@ impl Ctx {
     pub async fn bridge<M: 'static, Out: 'static, F: IntoSystem<Out, M>>(&self, func: F) -> Out {
         CachedBridgeFuture::<<F as cached_stuff::IntoSystem<Out, M>>::System, Out, M> {
             _p: PhantomData,
-            system_set: bridge_request::async_world_sync_point::<AsyncUi>.into_system_set().intern(),
+            system_set: bridge_request::async_world_sync_point::<AsyncUi>
+                .into_system_set()
+                .intern(),
             bridge_fn: IntoSystem::into_system(func),
             wake_signal: None,
             world: self.async_world.clone(),
             is_queued: Arc::new(AtomicBool::new(false)),
-        }.await.unwrap()
+        }
+        .await
+        .unwrap()
     }
-    pub async fn try_bridge<M: 'static, Out: 'static, F: IntoSystem<Out, M>>(&self, func: F) -> Result<Out, BridgeError> {
+    pub async fn try_bridge<M: 'static, Out: 'static, F: IntoSystem<Out, M>>(
+        &self,
+        func: F,
+    ) -> Result<Out, BridgeError> {
         CachedBridgeFuture::<<F as cached_stuff::IntoSystem<Out, M>>::System, Out, M> {
             _p: PhantomData,
-            system_set: bridge_request::async_world_sync_point::<AsyncUi>.into_system_set().intern(),
+            system_set: bridge_request::async_world_sync_point::<AsyncUi>
+                .into_system_set()
+                .intern(),
             bridge_fn: IntoSystem::into_system(func),
             wake_signal: None,
             world: self.async_world.clone(),
             is_queued: Arc::new(AtomicBool::new(false)),
-        }.await
+        }
+        .await
     }
 }
-
 
 /// Future representing a single in-flight bridging request between our async task and our `World`.
 struct CachedBridgeFuture<Func, Out, M> {
@@ -174,8 +188,7 @@ where
                 .world_scope
                 .try_with(|world| {
                     let Self {
-                        ref mut bridge_fn,
-                        ..
+                        ref mut bridge_fn, ..
                     } = *self;
                     // Attempt to acquire the typed `SystemState<P>`.
                     //

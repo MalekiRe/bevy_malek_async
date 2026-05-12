@@ -77,10 +77,10 @@ extern crate std;
 pub mod async_ui;
 mod bridge_future;
 mod bridge_request;
+mod cached_stuff;
 mod plugin;
 mod system_state;
 mod wake_signal;
-mod cached_stuff;
 
 pub use crate::bridge_future::{AsyncSystemState, BridgeError};
 pub use crate::bridge_request::async_world_sync_point;
