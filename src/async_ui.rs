@@ -450,16 +450,17 @@ impl<C: Component<Mutability = Mutable>> MutationTracker<C> {
                 });
             });
         world.commands().queue(move |world: &mut World| {
+            let query_state = QueryBuilder::<Entity, Changed<C>>::new(world).build();
+
+            impl<C2: Component<Mutability = Mutable>> MyIter for QueryState<Entity, Changed<C2>> {
+                fn entities(&mut self, world: &mut World) -> Vec<Entity> {
+                    self.iter(world).collect()
+                }
+            }
             world
                 .resource_mut::<MutationTrackingRes>()
                 .0
-                .insert(component_id, |world| {
-                    world
-                        .run_system_cached(|query: Query<Entity, Changed<C>>| {
-                            query.iter().collect::<Vec<_>>()
-                        })
-                        .unwrap()
-                });
+                .insert(component_id, Box::new(query_state));
         });
     }
     fn on_remove(mut world: DeferredWorld, HookContext { entity, .. }: HookContext) {
@@ -477,9 +478,11 @@ impl<C: Component<Mutability = Mutable>> MutationTracker<C> {
         })
     }
 }
-
+trait MyIter {
+    fn entities(&mut self, world: &mut World) -> Vec<Entity>;
+}
 #[derive(Resource, Default)]
-pub struct MutationTrackingRes(HashMap<ComponentId, fn(&mut World) -> Vec<Entity>>);
+pub struct MutationTrackingRes(HashMap<ComponentId, Box<dyn MyIter + Send + Sync>>);
 
 #[derive(EntityEvent)]
 struct MutationOccurred<C: Component<Mutability = Mutable>> {
@@ -494,7 +497,7 @@ pub fn pump_mutation_observers(world: &mut World) -> TickResult {
     world.resource_scope(
         |world: &mut World, mut mutation_tracking_res: Mut<MutationTrackingRes>| {
             for (component, query) in mutation_tracking_res.0.iter_mut() {
-                for item in query(world) {
+                for item in query.entities(world) {
                     let awa = *world
                         .entity(item)
                         .get::<MutationSender>()
