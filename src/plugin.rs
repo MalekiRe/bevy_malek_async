@@ -84,7 +84,7 @@ impl AsyncWorld {
     /// # Example
     /// ```rust
     /// use bevy_app::prelude::*;
-    /// use bevy_async::prelude::*;
+    /// use bevy_malek_async::prelude::*;
     /// use bevy_ecs::prelude::*;
     /// use bevy_tasks::AsyncComputeTaskPool;
     /// use bevy_platform::sync::atomic::AtomicBool;

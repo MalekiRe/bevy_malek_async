@@ -493,6 +493,10 @@ struct MutationOccurred<C: Component<Mutability = Mutable>> {
 struct MutationSender(HashMap<ComponentId, fn(Entity, &mut World)>);
 
 pub fn pump_mutation_observers(world: &mut World) -> TickResult {
+    if !world.contains_resource::<MutationTrackingRes>() {
+        return TickResult::NoWork
+    }
+
     let mut tick_result = TickResult::NoWork;
     world.resource_scope(
         |world: &mut World, mut mutation_tracking_res: Mut<MutationTrackingRes>| {
