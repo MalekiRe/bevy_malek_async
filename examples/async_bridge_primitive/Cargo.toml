@@ -1,0 +1,11 @@
+[package]
+name = "async_bridge_primitive"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bevy.workspace = true
+bevy_malek_async.workspace = true
+rand.workspace = true
+futures-timer.workspace = true

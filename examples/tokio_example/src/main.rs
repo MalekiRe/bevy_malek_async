@@ -16,10 +16,15 @@ fn main() {
 
 struct MySyncPoint;
 
-fn print_resource(mut last: Local<String>, res: ResMut<MyResource>) {
+fn print_resource(
+    mut last: Local<String>,
+    res: ResMut<MyResource>,
+    mut stop: MessageWriter<AppExit>,
+) {
     if last.as_str() != res.0.as_str() {
         *last = res.0.clone();
-        println!("{}", res.0);
+        println!("{}... (first kB)", &res.0[..1024]);
+        stop.write(AppExit::Success);
     }
 }
 

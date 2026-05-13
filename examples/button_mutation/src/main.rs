@@ -10,9 +10,8 @@ use bevy::{
     scene::prelude::Scene,
     ui_widgets::Activate,
 };
-use bevy_malek_async::AsyncPlugin;
 use bevy_malek_async::async_ui::{AsyncUiPlugin, Ctx};
-use bevy_malek_async_macros::bsn_ui;
+use bevy_malek_async::{AsyncPlugin, bsn_ui};
 use futures::FutureExt;
 use std::time::Duration;
 

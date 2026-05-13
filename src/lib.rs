@@ -82,6 +82,9 @@ mod plugin;
 mod system_state;
 mod wake_signal;
 
+#[cfg(feature = "bevy_malek_async_macros")]
+pub use bevy_malek_async_macros::{bsn_ui, bsn_ui_list};
+
 pub use crate::bridge_future::{AsyncSystemState, BridgeError};
 pub use crate::bridge_request::async_world_sync_point;
 pub use crate::plugin::{AsyncPlugin, AsyncTickBudget, AsyncWorld};

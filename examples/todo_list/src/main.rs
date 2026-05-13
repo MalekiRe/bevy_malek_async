@@ -17,9 +17,8 @@ use bevy::{
     ui::Checked,
     ui_widgets::{Activate, ValueChange},
 };
-use bevy_malek_async::AsyncPlugin;
 use bevy_malek_async::async_ui::{AsyncUi, AsyncUiPlugin, Ctx};
-use bevy_malek_async_macros::bsn_ui;
+use bevy_malek_async::{AsyncPlugin, bsn_ui};
 use futures::FutureExt;
 
 fn main() {
