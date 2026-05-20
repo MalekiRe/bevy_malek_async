@@ -1,10 +1,10 @@
-use bevy::feathers::controls::CheckboxProps;
 use bevy::{
     feathers::{
         FeathersPlugins,
         controls::{
-            ButtonProps, ButtonVariant, TextInputProps, button, checkbox, text_input,
-            text_input_container,
+            ButtonVariant, FeathersButton, FeathersButtonProps, FeathersCheckbox,
+            FeathersCheckboxProps, FeathersTextInput, FeathersTextInputContainer,
+            FeathersTextInputProps,
         },
         dark_theme::create_dark_theme,
         theme::{ThemeBackgroundColor, ThemedText, UiTheme},
@@ -12,7 +12,7 @@ use bevy::{
     },
     input_focus::{AutoFocus, tab_navigation::TabGroup},
     prelude::*,
-    scene::prelude::Scene,
+    scene::{SceneComponent, prelude::Scene},
     text::EditableText,
     ui::Checked,
     ui_widgets::{Activate, ValueChange},
@@ -20,6 +20,22 @@ use bevy::{
 use bevy_malek_async::async_ui::{AsyncUi, AsyncUiPlugin, Ctx};
 use bevy_malek_async::{AsyncPlugin, bsn_ui};
 use futures::FutureExt;
+
+fn button(props: FeathersButtonProps) -> impl Scene {
+    FeathersButton::scene(props)
+}
+
+fn checkbox(props: FeathersCheckboxProps) -> impl Scene {
+    FeathersCheckbox::scene(props)
+}
+
+fn text_input(props: FeathersTextInputProps) -> impl Scene {
+    FeathersTextInput::scene(props)
+}
+
+fn text_input_container() -> impl Scene {
+    FeathersTextInputContainer::scene(Default::default())
+}
 
 fn main() {
     App::new()
@@ -87,9 +103,9 @@ fn todo_root() -> impl Scene {
                             padding: UiRect::axes(px(8), px(6)),
                         }
                         Children [
-                            (#Checkbox checkbox(CheckboxProps::default())),
-                            (Text::new({text.clone()}) ThemedText ),
-                            (#Delete button(ButtonProps::default()) Text("Delete") ThemedText),
+                            (#Checkbox checkbox(FeathersCheckboxProps::default())),
+                            (Text::new(text.clone()) ThemedText ),
+                            (#Delete button(FeathersButtonProps::default()) Text("Delete") ThemedText),
                         ]
                         async |world: Ctx| {
                             world.on::<Activate>(#Delete).await;
@@ -164,7 +180,7 @@ fn todo_root() -> impl Scene {
                             :text_input_container
                             Node { flex_grow: 1.0 }
                             Children [(
-                                text_input(TextInputProps {
+                                text_input(FeathersTextInputProps {
                                     visible_width: None,
                                     max_characters: Some(120),
                                 })
@@ -173,7 +189,7 @@ fn todo_root() -> impl Scene {
                             )]
                         ),
                         (
-                            button(ButtonProps {
+                            button(FeathersButtonProps {
                                 variant: ButtonVariant::Primary,
                                 ..default()
                             })
@@ -195,17 +211,17 @@ fn todo_root() -> impl Scene {
                             }
                             Children [
                                 (
-                                    button(ButtonProps::default())
+                                    button(FeathersButtonProps::default())
                                     #AllFilter
                                     Children [(Text::new("All") ThemedText)]
                                 ),
                                 (
-                                    button(ButtonProps::default())
+                                    button(FeathersButtonProps::default())
                                     #ActiveFilter
                                     Children [(Text::new("Active") ThemedText)]
                                 ),
                                 (
-                                    button(ButtonProps::default())
+                                    button(FeathersButtonProps::default())
                                     #CompletedFilter
                                     Children [(Text::new("Completed") ThemedText)]
                                 ),

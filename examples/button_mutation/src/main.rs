@@ -1,19 +1,23 @@
 use bevy::{
     feathers::{
         FeathersPlugins,
-        controls::{ButtonProps, button},
+        controls::{FeathersButton, FeathersButtonProps},
         dark_theme::create_dark_theme,
         theme::{ThemeBackgroundColor, ThemedText, UiTheme},
         tokens,
     },
     prelude::*,
-    scene::prelude::Scene,
+    scene::{SceneComponent, prelude::Scene},
     ui_widgets::Activate,
 };
 use bevy_malek_async::async_ui::{AsyncUiPlugin, Ctx};
 use bevy_malek_async::{AsyncPlugin, bsn_ui};
 use futures::FutureExt;
 use std::time::Duration;
+
+fn button(props: FeathersButtonProps) -> impl Scene {
+    FeathersButton::scene(props)
+}
 
 fn main() {
     App::new()
@@ -52,7 +56,7 @@ fn demo_root() -> impl Scene {
           }
           Children [
               (#Minus
-                  button(ButtonProps::default())
+                  button(FeathersButtonProps::default())
                   Children[(Text::new("-1") ThemedText)] ),
               (#Counter
                     Text::new("0")
@@ -60,7 +64,7 @@ fn demo_root() -> impl Scene {
                     ButtonNumber(0)
                     Node { margin: UiRect::horizontal(px(10.0)) } ),
               (#Plus
-                  button(ButtonProps::default())
+                  button(FeathersButtonProps::default())
                   Children[(Text::new("+1") ThemedText)] )
           ]
       )]
