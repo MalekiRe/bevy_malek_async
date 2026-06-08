@@ -13,43 +13,17 @@ use bevy_platform::sync::{Arc, Weak};
 /// driven from a known `SyncPoint` on the world-owning thread.
 ///
 /// This supports arbitrary async runtimes as well as multiple Bevy Worlds / Bevy Apps.
-pub struct AsyncPlugin {
-    /// Upper bound on how many internal async world ticks we perform each time a
-    /// sync point system runs.
-    ///
-    /// A single "tick" means:
-    /// 1. collect queued bridge requests for that sync point,
-    /// 2. wake the corresponding async tasks,
-    /// 3. wait for each one to attempt a poll,
-    /// 4. apply any deferred `SystemState` work back into the world.
-    ///
-    /// We may need to do this multiple times because one task's progress can
-    /// unblock another task that previously returned `Poll::Pending`.
-    pub max_async_ticks_per_sync_point: usize,
-}
-
-impl Default for AsyncPlugin {
-    fn default() -> Self {
-        Self {
-            max_async_ticks_per_sync_point: 100,
-        }
-    }
-}
+#[derive(Default)]
+pub struct AsyncPlugin;
 
 impl bevy_app::Plugin for AsyncPlugin {
     fn build(&self, app: &mut App) {
         let strong_world = StrongAsyncWorld::default();
         let weak_world = AsyncWorld(Arc::downgrade(&strong_world.0));
-        app.insert_resource(AsyncTickBudget(self.max_async_ticks_per_sync_point))
-            .insert_resource(strong_world)
+        app.insert_resource(strong_world)
             .insert_resource(weak_world);
     }
 }
-
-/// Internal resource to manage a limit on how many times we try to drive the async <-> ecs bridge
-/// per sync point.
-#[derive(bevy_ecs_macros::Resource, Clone)]
-pub struct AsyncTickBudget(pub usize);
 
 /// This resource gives one the ability to create a bridge between an async task and the ecs.
 /// By calling `AsyncBridge::new(&self)` you create a new bridge between an async task

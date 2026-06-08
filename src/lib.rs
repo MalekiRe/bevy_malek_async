@@ -87,7 +87,7 @@ pub use bevy_malek_async_macros::{bsn_ui, bsn_ui_list};
 
 pub use crate::bridge_future::{AsyncSystemState, BridgeError};
 pub use crate::bridge_request::async_world_sync_point;
-pub use crate::plugin::{AsyncPlugin, AsyncTickBudget, AsyncWorld};
+pub use crate::plugin::{AsyncPlugin, AsyncWorld};
 
 /// The async prelude.
 ///
@@ -95,8 +95,7 @@ pub use crate::plugin::{AsyncPlugin, AsyncTickBudget, AsyncWorld};
 pub mod prelude {
     #[doc(hidden)]
     pub use crate::{
-        AsyncPlugin, AsyncSystemState, AsyncTickBudget, AsyncWorld, BridgeError,
-        async_world_sync_point,
+        AsyncPlugin, AsyncSystemState, AsyncWorld, BridgeError, async_world_sync_point,
     };
 }
 
