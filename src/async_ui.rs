@@ -218,12 +218,15 @@ mod async_observers {
         ) {
             let state = self.cached_state::<(Commands, Query<&MutationTracker<C>>)>();
             state
-                .bridge(AsyncUi, |(mut commands, query)| {
-                    if query.contains(e) {
-                        return;
-                    }
-                    commands.entity(e).insert(MutationTracker::<C>(PhantomData));
-                })
+                .bridge(
+                    AsyncUi,
+                    |mut commands: Commands, query: Query<&MutationTracker<C>>| {
+                        if query.contains(e) {
+                            return;
+                        }
+                        commands.entity(e).insert(MutationTracker::<C>(PhantomData));
+                    },
+                )
                 .await
                 .unwrap();
             self.on::<MutationOccurred<C>>(e).await;
@@ -234,39 +237,9 @@ mod async_observers {
         ) -> AsyncCloneObserver<E, B> {
             let state = self.cached_state::<(Commands, Query<&AsyncCloneObserver<E, B>>)>();
             state
-                .bridge(AsyncUi, move |(mut commands, q)| {
-                    if let Ok(async_observer) = q.get(e) {
-                        return async_observer.clone();
-                    }
-                    let (tx, rx) = crossbeam::channel::unbounded();
-                    let async_observer = AsyncCloneObserver {
-                        0: e,
-                        1: tx,
-                        2: None,
-                        3: PhantomData,
-                    };
-                    commands.entity(e).observe(move |on: On<E, B>| {
-                        for (notify, waker) in rx.try_iter() {
-                            let _ = notify.send((on.event().clone(), on.observer()));
-                            waker.wake();
-                        }
-                    });
-                    async_observer
-                })
-                .await
-                .unwrap()
-        }
-        pub async fn on_cloned<E: EntityEvent + Clone, B: Bundle>(&self, e: Entity) -> E {
-            let async_observer;
-            if !self
-                .observer_cache
-                .read()
-                .unwrap()
-                .contains_key(&(e, TypeId::of::<AsyncCloneObserver<E, B>>()))
-            {
-                async_observer = self
-                    .cached_state::<(Commands, Query<&AsyncCloneObserver<E, B>>)>()
-                    .bridge(AsyncUi, move |(mut commands, q)| {
+                .bridge(
+                    AsyncUi,
+                    move |mut commands: Commands, q: Query<&AsyncCloneObserver<E, B>>| {
                         if let Ok(async_observer) = q.get(e) {
                             return async_observer.clone();
                         }
@@ -284,7 +257,43 @@ mod async_observers {
                             }
                         });
                         async_observer
-                    })
+                    },
+                )
+                .await
+                .unwrap()
+        }
+        pub async fn on_cloned<E: EntityEvent + Clone, B: Bundle>(&self, e: Entity) -> E {
+            let async_observer;
+            if !self
+                .observer_cache
+                .read()
+                .unwrap()
+                .contains_key(&(e, TypeId::of::<AsyncCloneObserver<E, B>>()))
+            {
+                async_observer = self
+                    .cached_state::<(Commands, Query<&AsyncCloneObserver<E, B>>)>()
+                    .bridge(
+                        AsyncUi,
+                        move |mut commands: Commands, q: Query<&AsyncCloneObserver<E, B>>| {
+                            if let Ok(async_observer) = q.get(e) {
+                                return async_observer.clone();
+                            }
+                            let (tx, rx) = crossbeam::channel::unbounded();
+                            let async_observer = AsyncCloneObserver {
+                                0: e,
+                                1: tx,
+                                2: None,
+                                3: PhantomData,
+                            };
+                            commands.entity(e).observe(move |on: On<E, B>| {
+                                for (notify, waker) in rx.try_iter() {
+                                    let _ = notify.send((on.event().clone(), on.observer()));
+                                    waker.wake();
+                                }
+                            });
+                            async_observer
+                        },
+                    )
                     .await
                     .unwrap();
                 self.observer_cache.write().unwrap().insert(
@@ -310,43 +319,9 @@ mod async_observers {
         ) -> AsyncObserver<E, B> {
             let state = self.cached_state::<(Commands, Query<&AsyncObserver<E, B>>)>();
             state
-                .bridge(AsyncUi, move |(mut commands, q)| {
-                    if let Ok(async_observer) = q.get(e) {
-                        return async_observer.clone();
-                    }
-                    let (tx, rx) = crossbeam::channel::unbounded();
-                    let async_observer = AsyncObserver {
-                        0: e,
-                        1: tx,
-                        2: Arc::new(AtomicBool::new(false)),
-                        3: PhantomData,
-                        4: false,
-                    };
-                    commands.entity(e).observe(move |_on: On<E, B>| {
-                        for (notify, waker) in rx.try_iter() {
-                            notify.store(true, Ordering::Relaxed);
-                            waker.wake();
-                        }
-                    });
-                    async_observer
-                })
-                .await
-                .unwrap()
-        }
-        pub async fn on<E: EntityEvent>(&self, e: Entity) {
-            self.on_with::<E, ()>(e).await
-        }
-        pub async fn on_with<E: EntityEvent, B: Bundle>(&self, e: Entity) {
-            let async_observer;
-            if !self
-                .observer_cache
-                .read()
-                .unwrap()
-                .contains_key(&(e, TypeId::of::<AsyncObserver<E, B>>()))
-            {
-                async_observer = self
-                    .cached_state::<(Commands, Query<&AsyncObserver<E, B>>)>()
-                    .bridge(AsyncUi, move |(mut commands, q)| {
+                .bridge(
+                    AsyncUi,
+                    move |mut commands: Commands, q: Query<&AsyncObserver<E, B>>| {
                         if let Ok(async_observer) = q.get(e) {
                             return async_observer.clone();
                         }
@@ -365,7 +340,47 @@ mod async_observers {
                             }
                         });
                         async_observer
-                    })
+                    },
+                )
+                .await
+                .unwrap()
+        }
+        pub async fn on<E: EntityEvent>(&self, e: Entity) {
+            self.on_with::<E, ()>(e).await
+        }
+        pub async fn on_with<E: EntityEvent, B: Bundle>(&self, e: Entity) {
+            let async_observer;
+            if !self
+                .observer_cache
+                .read()
+                .unwrap()
+                .contains_key(&(e, TypeId::of::<AsyncObserver<E, B>>()))
+            {
+                async_observer = self
+                    .cached_state::<(Commands, Query<&AsyncObserver<E, B>>)>()
+                    .bridge(
+                        AsyncUi,
+                        move |mut commands: Commands, q: Query<&AsyncObserver<E, B>>| {
+                            if let Ok(async_observer) = q.get(e) {
+                                return async_observer.clone();
+                            }
+                            let (tx, rx) = crossbeam::channel::unbounded();
+                            let async_observer = AsyncObserver {
+                                0: e,
+                                1: tx,
+                                2: Arc::new(AtomicBool::new(false)),
+                                3: PhantomData,
+                                4: false,
+                            };
+                            commands.entity(e).observe(move |_on: On<E, B>| {
+                                for (notify, waker) in rx.try_iter() {
+                                    notify.store(true, Ordering::Relaxed);
+                                    waker.wake();
+                                }
+                            });
+                            async_observer
+                        },
+                    )
                     .await
                     .unwrap();
                 self.observer_cache.write().unwrap().insert(
@@ -494,7 +509,7 @@ struct MutationSender(HashMap<ComponentId, fn(Entity, &mut World)>);
 
 pub fn pump_mutation_observers(world: &mut World) -> TickResult {
     if !world.contains_resource::<MutationTrackingRes>() {
-        return TickResult::NoWork
+        return TickResult::NoWork;
     }
 
     let mut tick_result = TickResult::NoWork;

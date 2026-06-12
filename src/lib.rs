@@ -12,7 +12,7 @@
 //! - At most one future has world access at a time
 //! - Futures only access the world while the scoped pointer (managed by the bridge driver) is live
 //! - `SystemState` is always initialized before use
-//! - Deferred ops are only applied after every future finishes polling and releases world access
+//! - Deferred ops are applied by each future itself while it holds world access
 //! - The driver can't deadlock
 //! - All futures that want world access can eventually complete (assuming fair scheduling by the async runtime)
 //! - If the world is dropped, futures don't leak and eventually finish (in an error state)
@@ -36,11 +36,11 @@
 //!
 //!  -> Direct access: non-queued future polled during scope,
 //!  bypasses queue, acquires locks, completes (no signal)
+//!
+//!  -> Futures apply their own deferred ops from `SystemState` while they hold world access
 //!   4. Wait for all signal guards to drop + scope mutex released
 //!   5. Unpublish pointer, scope ends.
-//!   6. Apply any deferred ops from `SystemState` of polled futures
-//!   7. Loop (up to [`AsyncTickBudget`]) or return
-//!   8. Schedule resumes (normal systems run)
+//!   6. Schedule resumes (normal systems run)
 //!
 //!
 //! Dual locking:
@@ -85,7 +85,9 @@ mod wake_signal;
 #[cfg(feature = "bevy_malek_async_macros")]
 pub use bevy_malek_async_macros::{bsn_ui, bsn_ui_list};
 
-pub use crate::bridge_future::{AsyncSystemState, BridgeError};
+pub use crate::bridge_future::{
+    AsyncSystemParamFunction, AsyncSystemState, BridgeError, BridgeFuture,
+};
 pub use crate::bridge_request::async_world_sync_point;
 pub use crate::plugin::{AsyncPlugin, AsyncWorld};
 
@@ -173,8 +175,10 @@ mod tests {
             let world = world.clone();
             AsyncComputeTaskPool::get()
                 .spawn(async move {
-                    let system_state = world.system_state::<Res<MyResource>>();
-                    match system_state.bridge(MySyncPoint, |_| unreachable!()).await {
+                    match world
+                        .bridge(MySyncPoint, |_: Res<MyResource>| unreachable!())
+                        .await
+                    {
                         Err(BridgeError::SystemParamValidation(_)) => {
                             FAILED_VALIDATION.store(true, Ordering::Relaxed);
                         }

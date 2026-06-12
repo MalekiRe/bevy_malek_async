@@ -63,12 +63,7 @@ fn setup(
     let pool = bevy::tasks::AsyncComputeTaskPool::get();
 
     // Reuse tasks so you don't have to pay the system init cost every time it runs.
-    let task = async_world.system_state::<(
-        Commands,
-        Local<Option<(Handle<Mesh>, Handle<StandardMaterial>)>>,
-        ResMut<Assets<Mesh>>,
-        ResMut<Assets<StandardMaterial>>,
-    )>();
+    let task = async_world.system_state();
     for x in -NUM_CUBES..NUM_CUBES {
         for z in -NUM_CUBES..NUM_CUBES {
             // Spawn a task on the async compute pool
@@ -79,7 +74,10 @@ fn setup(
                 futures_timer::Delay::new(delay).await;
                 task.bridge(
                     MySyncPoint,
-                    |(mut commands, mut box_handles, mut meshes, mut materials)| {
+                    |mut commands: Commands,
+                     mut box_handles: Local<Option<(Handle<Mesh>, Handle<StandardMaterial>)>>,
+                     mut meshes: ResMut<Assets<Mesh>>,
+                     mut materials: ResMut<Assets<StandardMaterial>>| {
                         // The first time this bridge runs it will initialize the box mesh and box material, and then it will reuse them from then on.
                         if box_handles.is_none() {
                             box_handles.replace((

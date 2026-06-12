@@ -71,7 +71,7 @@ fn todo_root() -> impl Scene {
         async |world: Ctx| {
             loop {
                  world.on::<Activate>(#AddTodoButton).await;
-                 world.cached_state::<(Commands, Query<&EditableText>)>().bridge(AsyncUi, |(mut commands, texts)| {
+                 world.cached_state::<(Commands, Query<&EditableText>)>().bridge(AsyncUi, |mut commands: Commands, texts: Query<&EditableText>| {
                     let text = texts.get(#TodoInput).unwrap().value().to_string();
                     let todo_list_root: Entity = #TodoListRoot;
                     let child =
@@ -93,7 +93,7 @@ fn todo_root() -> impl Scene {
                         ]
                         async |world: Ctx| {
                             world.on::<Activate>(#Delete).await;
-                            world.cached_state::<Commands>().bridge(AsyncUi, |mut commands| {
+                            world.cached_state::<Commands>().bridge(AsyncUi, |mut commands: Commands| {
                                 commands.entity(#This).despawn();
                             }).await.unwrap();
                         }

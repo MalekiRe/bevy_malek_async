@@ -62,8 +62,7 @@ async fn fetch_example_com(
     let body = resp.text().await?;
     println!("Fetched google.com: status={status}, bytes={}", body.len());
     async_world
-        .system_state::<ResMut<MyResource>>()
-        .bridge(MySyncPoint, |mut my_resource| {
+        .bridge(MySyncPoint, |mut my_resource: ResMut<MyResource>| {
             my_resource.0 = body;
         })
         .await?;

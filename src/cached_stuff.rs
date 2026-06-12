@@ -1,43 +1,20 @@
 use crate::async_ui::{AsyncUi, Ctx};
+use crate::bridge_future::AsyncSystemParamFunction;
 use crate::bridge_request::BridgeRequest;
 use crate::wake_signal::WakeSignaler;
 use crate::{AsyncWorld, BridgeError, bridge_request, cached_stuff, wake_signal};
 use bevy_ecs::prelude::{IntoSystemSet, SystemSet};
 use bevy_ecs::schedule::InternedSystemSet;
-use bevy_ecs::system::{SystemParam, SystemParamItem, SystemParamValidationError};
+use bevy_ecs::system::SystemParamValidationError;
 use bevy_ecs::world::World;
 use std::marker::PhantomData;
 
-pub trait SystemParamFunction<Marker> {
-    type Out;
-    type Param: SystemParam + 'static;
-    fn run(self, param_value: SystemParamItem<Self::Param>) -> Self::Out;
-}
-
 pub struct FunctionSystem<Marker, Out, F>
 where
-    F: SystemParamFunction<Marker>,
+    F: AsyncSystemParamFunction<Marker>,
 {
     func: Option<F>,
     marker: PhantomData<(Marker, Out)>,
-}
-
-impl<Out, Func, F0: SystemParam + 'static> SystemParamFunction<fn(F0) -> Out> for Func
-where
-    Func: FnOnce(F0) -> Out + FnOnce(SystemParamItem<F0>) -> Out,
-    Out: 'static,
-{
-    type Out = Out;
-    type Param = (F0,);
-
-    #[inline]
-    fn run(self, param_value: SystemParamItem<Self::Param>) -> Self::Out {
-        let (f0,) = param_value;
-        fn call_inner<Out, F0>(f: impl FnOnce(F0) -> Out, F0: F0) -> Out {
-            f(F0)
-        }
-        call_inner(self, f0)
-    }
 }
 
 pub trait System {
@@ -49,7 +26,7 @@ impl<Marker, Out, F> System for FunctionSystem<Marker, Out, F>
 where
     Marker: 'static,
     Out: 'static,
-    F: SystemParamFunction<Marker, Out = Out>,
+    F: AsyncSystemParamFunction<Marker, Out = Out>,
 {
     type Out = Out;
     #[inline]
@@ -90,7 +67,7 @@ impl<Marker, Out, F> IntoSystem<Out, (IsFunctionSystem, Marker)> for F
 where
     Marker: 'static,
     Out: 'static,
-    F: SystemParamFunction<Marker, Out = Out>,
+    F: AsyncSystemParamFunction<Marker, Out = Out>,
 {
     type System = FunctionSystem<Marker, Out, F>;
 
@@ -190,8 +167,6 @@ where
             // 1. The task's waker, so the sync-point driver can wake it.
             // 2. The wake handshake signal, so the driver can wait until the wake has actually
             // been processed.
-            // 3. An initialization hint for the typed `SystemState`.
-            // 4. The erased `SystemState` storage itself.
             strong_world
                 .bridge_requests
                 .try_send(
@@ -199,7 +174,6 @@ where
                     BridgeRequest {
                         waker: cx.waker().clone(),
                         wake_waiter,
-                        system_state: None,
                     },
                 )
                 .ok()
