@@ -1,4 +1,3 @@
-use crate::async_ui::pump_mutation_observers;
 use crate::plugin::StrongAsyncWorld;
 use bevy_ecs::prelude::{IntoSystemSet, SystemSet, World};
 use bevy_ecs::schedule::InternedSystemSet;
@@ -61,8 +60,6 @@ pub fn async_world_sync_point<SyncPoint: 'static>(world: &mut World) {
     }
     this.world_scope
         .scope(world, || wake_requests_and_wait(queued_requests));
-
-    pump_mutation_observers(world);
 }
 
 #[derive(Default)]
@@ -83,14 +80,6 @@ impl Drop for AsyncWorldInner {
     }
 }
 
-/// Whether a tick attempt made any progress.
-#[derive(PartialEq)]
-pub(crate) enum TickResult {
-    /// We found and processed at least one queued bridge request.
-    DidWork,
-    /// There was no queued work available for the `SyncPoint`.
-    NoWork,
-}
 
 /// A queued access request bridging an async task into ECS.
 pub(crate) struct BridgeRequest {

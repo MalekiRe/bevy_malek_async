@@ -48,7 +48,7 @@ fn setup(
     // Spawn a point light with shadows enabled
     commands.spawn((
         PointLight {
-            shadow_maps_enabled: true,
+            shadows_enabled: true,
             ..default()
         },
         Transform::from_xyz(0.0, LIGHT_RADIUS, 4.0),

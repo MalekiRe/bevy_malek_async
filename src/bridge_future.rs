@@ -278,17 +278,9 @@ where
                     } = *self;
                     // Lock the system state. The unwrap is safe since we only try_lock when we have
                     // exclusive world access, so the lock must not be contested.
-                    let mut system_state = system_state.try_lock::<Func::Param>(world).expect("Lock 
+                    let mut system_state = system_state.try_lock::<Func::Param>(world).expect("Lock
                     should never be contended since we have exclusive world access");
-
-                    let param = match system_state.get_mut(world) {
-                        Ok(param) => param,
-                        Err(system_param_validation_error) => {
-                            return Poll::Ready(Err(BridgeError::SystemParamValidation(
-                                system_param_validation_error,
-                            )));
-                        }
-                    };
+                    let param = system_state.get_mut(world);
                     // We finally have `P::Item<'w, 's>`, yay!, so consume the stored `FnOnce`, run it,
                     // and complete the future.
                     let out = bridge_fn.take().unwrap().run(param);

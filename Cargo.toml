@@ -9,7 +9,7 @@ description = "async runtime agnostic access to the bevy ecs"
 keywords = ["bevy", "async"]
 
 [features]
-default = ["std", "bevy_tasks", "bevy_malek_async_macros"]
+default = ["std", "bevy_tasks"]
 
 std = [
     "bevy_app/std",
@@ -26,7 +26,6 @@ bevy_ecs.workspace = true
 bevy_ecs_macros.workspace = true
 bevy_platform.workspace = true
 bevy_tasks = { workspace = true, optional = true }
-bevy_scene.workspace = true
 
 # other
 scoped_static_storage.workspace = true
@@ -35,7 +34,6 @@ thiserror.workspace = true
 crossbeam.workspace = true
 async-channel.workspace = true
 futures.workspace = true
-bevy_malek_async_macros = { workspace = true, optional = true }
 
 [package.metadata.docs.rs]
 rustdoc-args = [
@@ -48,27 +46,20 @@ all-features = true
 [workspace]
 members = [
     ".",
-    "macros",
     "examples/async_bridge_primitive",
-    "examples/button_mutation",
-    "examples/todo_list",
     "examples/tokio_example",
 ]
 
 [workspace.dependencies]
 # library crates
 bevy_malek_async = { path = "." }
-bevy_malek_async_macros = { path = "./macros" }
 
 # bevy (temporarily pinned at pre-feathers commit)
-bevy_app = { git = "https://github.com/bevyengine/bevy", rev = "cfb897f77de13217a29dd690532e6cdc4c494272", default-features = false }
-bevy_ecs = { git = "https://github.com/bevyengine/bevy", rev = "cfb897f77de13217a29dd690532e6cdc4c494272", default-features = false }
-bevy_ecs_macros = { git = "https://github.com/bevyengine/bevy", rev = "cfb897f77de13217a29dd690532e6cdc4c494272" }
-bevy_platform = { git = "https://github.com/bevyengine/bevy", rev = "cfb897f77de13217a29dd690532e6cdc4c494272", default-features = false }
-bevy_tasks = { git = "https://github.com/bevyengine/bevy", rev = "cfb897f77de13217a29dd690532e6cdc4c494272", default-features = false }
-bevy_scene = { git = "https://github.com/bevyengine/bevy", rev = "cfb897f77de13217a29dd690532e6cdc4c494272" }
-bevy_macro_utils = { git = "https://github.com/bevyengine/bevy", rev = "cfb897f77de13217a29dd690532e6cdc4c494272" }
-bevy = { git = "https://github.com/bevyengine/bevy", rev = "cfb897f77de13217a29dd690532e6cdc4c494272", features = ["experimental_bevy_feathers", "debug"] }
+bevy_app = { version = "0.18.1", default-features = false }
+bevy_ecs = { version = "0.18.1", default-features = false }
+bevy_ecs_macros = { version = "0.18.1" }
+bevy_platform = { version = "0.18.1", default-features = false }
+bevy_tasks = { version = "0.18.1", default-features = false }
 
 # dependencies
 scoped_static_storage = { version = "0.1.2", default-features = false }
