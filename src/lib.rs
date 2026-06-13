@@ -81,7 +81,8 @@ mod system_state;
 mod wake_signal;
 
 pub use crate::bridge_future::{
-    AsyncSystemParamFunction, AsyncSystemState, BridgeError, BridgeFuture,
+    AsyncExclusiveSystemParamFunction, AsyncSystemParamFunction, AsyncSystemState, BridgeError,
+    BridgeFunction, BridgeFuture, IsExclusiveBridgeFunction, IsParamBridgeFunction,
 };
 pub use crate::bridge_request::async_world_sync_point;
 pub use crate::plugin::{AsyncPlugin, AsyncWorld};
@@ -186,6 +187,279 @@ mod tests {
         app.update();
 
         assert!(FAILED_VALIDATION.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn spurious_poll_is_ignored() {
+        use core::pin::Pin;
+        use core::task::{Context, Poll};
+        use std::time::{Duration, Instant};
+
+        struct MySyncPoint;
+        static ACCESS_RAN: AtomicBool = AtomicBool::new(false);
+        static SPURIOUS_POLL_DONE: AtomicBool = AtomicBool::new(false);
+
+        struct WakeOnce(bool);
+        impl Future for WakeOnce {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if self.0 {
+                    SPURIOUS_POLL_DONE.store(true, Ordering::Relaxed);
+                    Poll::Ready(())
+                } else {
+                    self.0 = true;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+        }
+
+        let mut app = App::new();
+        app.add_plugins((
+            AsyncPlugin::default(),
+            ScheduleRunnerPlugin::default(),
+            TaskPoolPlugin::default(),
+        ));
+
+        app.add_systems(Startup, move |world: Res<AsyncWorld>| {
+            let world = world.clone();
+            AsyncComputeTaskPool::get()
+                .spawn(async move {
+                    let bridge = world.bridge(MySyncPoint, |mut commands: Commands| {
+                        commands.spawn_empty();
+                    });
+                    let (result, ()) = futures::future::join(bridge, WakeOnce(false)).await;
+                    result.unwrap();
+                    ACCESS_RAN.store(true, Ordering::Relaxed);
+                })
+                .detach();
+        });
+
+        app.update();
+
+        let start = Instant::now();
+        while !SPURIOUS_POLL_DONE.load(Ordering::Relaxed) {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "the task never finished its spurious poll (did the bridge future panic?)"
+            );
+            std::thread::yield_now();
+        }
+
+        app.add_systems(Update, async_world_sync_point::<MySyncPoint>);
+        let start = Instant::now();
+        while !ACCESS_RAN.load(Ordering::Relaxed) {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "the bridge never completed after the spurious poll"
+            );
+            app.update();
+        }
+    }
+
+    #[test]
+    fn serial_bridges_complete_in_one_sync_point() {
+        use bevy_platform::sync::atomic::AtomicUsize;
+
+        struct MySyncPoint;
+        static BOTH_RAN: AtomicBool = AtomicBool::new(false);
+        static SYNC_POINT_RUNS: AtomicUsize = AtomicUsize::new(0);
+        // can't use option here, sucks, using sentinel value instead
+        static FIRST_RAN_AT: AtomicUsize = AtomicUsize::new(usize::MAX);
+        // can't use option here, sucks, using sentinel value instead
+        static SECOND_RAN_AT: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+        let mut app = App::new();
+        app.add_plugins((
+            AsyncPlugin::default(),
+            ScheduleRunnerPlugin::default(),
+            TaskPoolPlugin::default(),
+        ));
+
+        app.add_systems(
+            Update,
+            (
+                || {
+                    SYNC_POINT_RUNS.fetch_add(1, Ordering::Relaxed);
+                },
+                async_world_sync_point::<MySyncPoint>,
+            )
+                .chain(),
+        );
+
+        app.add_systems(Startup, move |world: &mut World| {
+            let world = world.resource::<AsyncWorld>().clone();
+            AsyncComputeTaskPool::get()
+                .spawn_local(async move {
+                    world
+                        .bridge(MySyncPoint, |mut commands: Commands| {
+                            FIRST_RAN_AT.store(SYNC_POINT_RUNS.load(Ordering::Relaxed), Ordering::Relaxed);
+                            commands.spawn_empty();
+                        })
+                        .await
+                        .unwrap();
+                    world
+                        .bridge(MySyncPoint, |mut commands: Commands| {
+                            SECOND_RAN_AT.store(SYNC_POINT_RUNS.load(Ordering::Relaxed), Ordering::Relaxed);
+                            commands.spawn_empty();
+                        })
+                        .await
+                        .unwrap();
+                    BOTH_RAN.store(true, Ordering::Relaxed);
+                })
+                .detach();
+        });
+
+        for _ in 0..10 {
+            app.update();
+            if BOTH_RAN.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        assert!(BOTH_RAN.load(Ordering::Relaxed));
+        assert_eq!(
+            FIRST_RAN_AT.load(Ordering::Relaxed),
+            SECOND_RAN_AT.load(Ordering::Relaxed),
+            "the second bridge should have completed in the same sync point as the first"
+        );
+    }
+
+    #[test]
+    fn contended_genuine_wake_retries() {
+        use core::pin::Pin;
+        use core::task::{Context, Poll};
+        use std::sync::Arc;
+        use std::sync::mpsc::channel;
+        use std::time::{Duration, Instant};
+
+        struct SyncA;
+        struct SyncB;
+
+        static F1_RAN: AtomicBool = AtomicBool::new(false);
+        static CONTENDER_HOLDS_LOCK: AtomicBool = AtomicBool::new(false);
+
+        struct FlagWaker(AtomicBool);
+        impl futures::task::ArcWake for FlagWaker {
+            fn wake_by_ref(arc_self: &Arc<Self>) {
+                arc_self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let (world_tx, world_rx) = channel();
+        let (update_req_tx, update_req_rx) = channel::<()>();
+        let (update_done_tx, update_done_rx) = channel::<()>();
+        let app_thread = std::thread::spawn(move || {
+            let mut app = App::new();
+            app.add_plugins((
+                AsyncPlugin::default(),
+                ScheduleRunnerPlugin::default(),
+                TaskPoolPlugin::default(),
+            ));
+            app.add_systems(Update, async_world_sync_point::<SyncA>);
+            app.update();
+            world_tx
+                .send(app.world().resource::<AsyncWorld>().clone())
+                .unwrap();
+            while update_req_rx.recv().is_ok() {
+                app.update();
+                update_done_tx.send(()).unwrap();
+            }
+        });
+        let world = world_rx.recv().unwrap();
+
+        let mut f1 = world.bridge(SyncA, |mut commands: Commands| {
+            commands.spawn_empty();
+            F1_RAN.store(true, Ordering::Relaxed);
+        });
+        let flag = Arc::new(FlagWaker(AtomicBool::new(false)));
+        let waker = futures::task::waker(flag.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(Pin::new(&mut f1).poll(&mut cx).is_pending());
+
+        let contender_world = world.clone();
+        let contender = std::thread::spawn(move || {
+            let mut f2 = contender_world.bridge(SyncB, |_: Commands| {
+                CONTENDER_HOLDS_LOCK.store(true, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(200));
+            });
+            let waker = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            loop {
+                if let Poll::Ready(result) = Pin::new(&mut f2).poll(&mut cx) {
+                    result.unwrap();
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        });
+
+        update_req_tx.send(()).unwrap();
+        let start = Instant::now();
+        while !CONTENDER_HOLDS_LOCK.load(Ordering::Relaxed) {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "the contender never got direct access to the world"
+            );
+            std::thread::yield_now();
+        }
+
+        let start = Instant::now();
+        loop {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "f1 was starved, its genuine wake was consumed without retry or acknowledgement"
+            );
+            if !flag.0.swap(false, Ordering::AcqRel) {
+                std::thread::yield_now();
+                continue;
+            }
+            if let Poll::Ready(result) = Pin::new(&mut f1).poll(&mut cx) {
+                result.unwrap();
+                break;
+            }
+        }
+        assert!(F1_RAN.load(Ordering::Relaxed));
+
+        update_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the driver deadlocked at the sync point");
+        contender.join().unwrap();
+        drop(update_req_tx);
+        app_thread.join().unwrap();
+    }
+
+    #[test]
+    fn exclusive_world_access() {
+        struct MySyncPoint;
+        static ACCESS_RAN: AtomicBool = AtomicBool::new(false);
+
+        let mut app = App::new();
+        app.add_plugins((
+            AsyncPlugin::default(),
+            ScheduleRunnerPlugin::default(),
+            TaskPoolPlugin::default(),
+        ));
+
+        app.add_systems(Update, async_world_sync_point::<MySyncPoint>);
+
+        app.add_systems(Startup, move |world: Res<AsyncWorld>| {
+            let world = world.clone();
+            AsyncComputeTaskPool::get()
+                .spawn(async move {
+                    world
+                        .bridge(MySyncPoint, |world: &mut World| {
+                            world.spawn_empty();
+                            ACCESS_RAN.store(true, Ordering::Relaxed);
+                        })
+                        .await
+                        .unwrap();
+                })
+                .detach();
+        });
+
+        app.update();
+
+        assert!(ACCESS_RAN.load(Ordering::Relaxed));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::bridge_future::{AsyncSystemParamFunction, AsyncSystemState, BridgeFuture};
+use crate::bridge_future::{AsyncSystemState, BridgeFunction, BridgeFuture};
 use bevy_app::App;
 use bevy_ecs::system::SystemParam;
 use bevy_platform::sync::{Arc, Weak};
@@ -111,9 +111,9 @@ impl AsyncWorld {
         &self,
         sync_point: SyncPoint,
         bridge_fn: BridgeFn,
-    ) -> BridgeFuture<BridgeFn, Marker>
+    ) -> BridgeFuture<BridgeFn, BridgeFn::Out>
     where
-        BridgeFn: AsyncSystemParamFunction<Marker>,
+        BridgeFn: BridgeFunction<Marker>,
     {
         self.system_state::<BridgeFn::Param>()
             .bridge(sync_point, bridge_fn)

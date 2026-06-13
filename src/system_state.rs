@@ -29,17 +29,21 @@ impl<P: SystemParam + 'static> Default for SystemStateCell<P> {
 /// The operations on the typed `SystemState` (initialization, access, and applying deferred
 /// state) all happen through the `impl dyn` implementation below, inside the bridge future
 /// itself.
-pub(crate) trait ErasedSystemStateCell: Send + Sync + core::any::Any + 'static {}
+///
+/// This is `pub` because it needs to be to exist in [`crate::BridgeFunction::run_with_world`],
+/// This module is private so the trait itself is sealed, probably good practice.
+#[doc(hidden)]
+pub trait ErasedSystemStateCell: Send + Sync + core::any::Any + 'static {}
 
 impl<P: SystemParam + 'static> ErasedSystemStateCell for SystemStateCell<P> {}
 
 impl dyn ErasedSystemStateCell {
     /// This function initializes the [`SystemStateCell`] if it hasn't already been initialized, and
     /// then returns the [`MutexGuard`] of the `SystemState` if it isn't being used by another thread.
-    pub(crate) fn try_lock<'w, 'a, P: SystemParam + 'static>(
+    pub(crate) fn lock<'w, 'a, P: SystemParam + 'static>(
         &'a self,
         world: &'w mut World,
-    ) -> Option<MutexGuard<'a, SystemState<P>>>
+    ) -> MutexGuard<'a, SystemState<P>>
     where
         'a: 'w,
     {
@@ -49,13 +53,10 @@ impl dyn ErasedSystemStateCell {
             .unwrap()
             .0
             .get_or_init(|| Mutex::new(SystemState::new(world)))
-            // Use `try_lock` rather than blocking:
-            // if another request currently owns the typed `SystemState<P>`, the
-            // caller should yield with `Poll::Pending` instead of stalling a
-            // thread. We get ticked optimistically many times so it's okay. We aren't guaranteed to
-            // run everytime so we can return Poll::Pending instead of blocking an async task
-            // which would be very bad.
-            .try_lock()
-            .ok()
+            // All world access is serialized by the scope lock in `bridge_request`, so this
+            // mutex is never contended; it exists because clones of an `AsyncSystemState` share the
+            // same typed state across tasks.
+            .lock()
+            .expect("Lock poisoned")
     }
 }

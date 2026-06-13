@@ -14,10 +14,6 @@ use bevy_ecs::schedule::InternedSystemSet;
 /// it's ECS work, because it's single threaded, so you can use `spawn_local` if you want
 /// determinism.
 ///
-/// This function attempts to tick queued work several times, up to `MaxAsyncTicksPerSyncPoint`.
-/// If one internal tick finds no work, we opportunistically tick the local global task pool and
-/// try once more before returning early.
-///
 /// We tick queued work multiple times for two reasons. The first is that serial `.await` calls
 /// should try to all be completed within the same `SyncPoint` such as
 /// ```rust,ignore
@@ -96,7 +92,8 @@ pub(crate) struct BridgeRequest {
 fn wake_requests_and_wait(queued_requests: bevy_platform::prelude::Vec<BridgeRequest>) {
     // Because currently we do not run non-conflicting system param requests in parallel (this is
     // follow up work) we can just queue and wait for each async task in order.
-    for BridgeRequest { waker, wake_waiter }  in queued_requests {
+    for BridgeRequest { waker, wake_waiter } in queued_requests {
+        wake_waiter.notify();
         waker.wake();
 
         #[cfg(feature = "bevy_tasks")]

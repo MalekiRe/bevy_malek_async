@@ -5,6 +5,7 @@ use crate::wake_signal::WakeSignaler;
 use crate::{bridge_request, wake_signal};
 use bevy_ecs::schedule::{InternedSystemSet, IntoSystemSet, SystemSet};
 use bevy_ecs::system::{SystemParam, SystemParamItem};
+use bevy_ecs::world::World;
 use bevy_platform::sync::Arc;
 use core::marker::PhantomData;
 
@@ -77,6 +78,71 @@ impl_system_param_function!(
     F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15
 );
 
+pub trait AsyncExclusiveSystemParamFunction<Marker> {
+    type Out;
+    fn run(self, world: &mut World) -> Self::Out;
+}
+
+impl<Out, Func> AsyncExclusiveSystemParamFunction<fn(&mut World) -> Out> for Func
+where
+    Func: FnOnce(&mut World) -> Out,
+    Out: 'static,
+{
+    type Out = Out;
+
+    #[inline]
+    fn run(self, world: &mut World) -> Self::Out {
+        self(world)
+    }
+}
+
+#[doc(hidden)]
+pub struct IsParamBridgeFunction;
+
+#[doc(hidden)]
+pub struct IsExclusiveBridgeFunction;
+
+pub trait BridgeFunction<Marker> {
+    type Out;
+    type Param: SystemParam + 'static;
+
+    #[doc(hidden)]
+    fn run_with_world(self, world: &mut World, state: &dyn ErasedSystemStateCell) -> Self::Out;
+}
+
+impl<Marker, Func> BridgeFunction<(IsParamBridgeFunction, Marker)> for Func
+where
+    Func: AsyncSystemParamFunction<Marker>,
+{
+    type Out = Func::Out;
+    type Param = Func::Param;
+
+    fn run_with_world(self, world: &mut World, state: &dyn ErasedSystemStateCell) -> Self::Out {
+        // Lock the system state. The unwrap is safe since we only try_lock when we have
+        // exclusive world access, so the lock must not be contested.
+        let mut system_state = state.lock::<Func::Param>(world);
+        let param = system_state.get_mut(world);
+        // We finally have `P::Item<'w, 's>`, yay!, so consume the stored `FnOnce`, run it,
+        // and complete the future.
+        let out = AsyncSystemParamFunction::run(self, param);
+        // Apply any deferred state (e.g. `Commands`) back into the world.
+        system_state.apply(world);
+        out
+    }
+}
+
+impl<Marker, Func> BridgeFunction<(IsExclusiveBridgeFunction, Marker)> for Func
+where
+    Func: AsyncExclusiveSystemParamFunction<Marker>,
+{
+    type Out = Func::Out;
+    type Param = ();
+
+    fn run_with_world(self, world: &mut World, _state: &dyn ErasedSystemStateCell) -> Self::Out {
+        AsyncExclusiveSystemParamFunction::run(self, world)
+    }
+}
+
 /// Handle that lets an async task request temporary access to an ECS
 /// `SystemParam` or a tuple of them.
 ///
@@ -144,21 +210,21 @@ impl<P: SystemParam + 'static> AsyncSystemState<P> {
         &self,
         _sync_point: SyncPoint,
         bridge_fn: BridgeFn,
-    ) -> BridgeFuture<BridgeFn, Marker>
+    ) -> BridgeFuture<BridgeFn, BridgeFn::Out>
     where
         Marker: 'static,
-        BridgeFn: AsyncSystemParamFunction<Marker, Param = P>,
+        BridgeFn: BridgeFunction<Marker, Param = P>,
     {
         // This function returns the concrete [`BridgeFuture`] rather than being an `async fn` so that the
         // future's `Send`-ness is structural, which keeps multi-parameter closures usable inside
         // `Send` tasks (an `async fn`'s opaque future trips rust's higher-ranked lifetime checks
         // there).
         BridgeFuture {
-            _p: PhantomData,
             system_set: bridge_request::async_world_sync_point::<SyncPoint>
                 .into_system_set()
                 .intern(),
             bridge_fn: Some(bridge_fn),
+            run: <BridgeFn as BridgeFunction<Marker>>::run_with_world,
             wake_signal: None,
             system_state: self.system_state.clone(),
             world: self.world.clone(),
@@ -182,8 +248,7 @@ pub enum BridgeError {
 }
 
 /// Future representing a single in-flight bridging request between our async task and our `World`.
-pub struct BridgeFuture<Func, Marker> {
-    _p: PhantomData<fn() -> Marker>,
+pub struct BridgeFuture<Func, Out> {
     /// Interned system-set key identifying which sync-point queue this future
     /// should be sent to.
     system_set: InternedSystemSet,
@@ -191,6 +256,7 @@ pub struct BridgeFuture<Func, Marker> {
     /// This is an option just so we can take it out when we run it so we can use `FnOnce`
     /// instead of `FnMut`, so it's more flexible than true systems.
     bridge_fn: Option<Func>,
+    run: fn(Func, &mut World, &dyn ErasedSystemStateCell) -> Out,
     /// Wake signal for the currently queued wake cycle, if any.
     ///
     /// The future drops this at the end of `poll` which acts as acknowledgement that the wake
@@ -203,14 +269,10 @@ pub struct BridgeFuture<Func, Marker> {
     queued: bool,
 }
 
-impl<Func, Marker> Unpin for BridgeFuture<Func, Marker> {}
+impl<Func, Out> Unpin for BridgeFuture<Func, Out> {}
 
-impl<Func, Marker> Future for BridgeFuture<Func, Marker>
-where
-    Marker: 'static,
-    Func: AsyncSystemParamFunction<Marker>,
-{
-    type Output = Result<Func::Out, BridgeError>;
+impl<Func, Out> Future for BridgeFuture<Func, Out> {
+    type Output = Result<Out, BridgeError>;
 
     fn poll(
         mut self: core::pin::Pin<&mut Self>,
@@ -226,70 +288,66 @@ where
             return Poll::Ready(Err(BridgeError::WorldDropped));
         };
 
-        if !self.queued {
-            debug_assert!(self.wake_signal.is_none());
-            self.queued = true;
-            // No world is currently exposed. That means we are being polled
-            // outside the `async_world_sync_point`, so we cannot access ECS yet.
-            //
-            // Instead, enqueue ourselves to be revisited when the matching
-            // sync-point system runs.
-            let (wake_signal, wake_waiter) = wake_signal::pair();
-            // Store the wake_signal locally so dropping it at the end of the next
-            // poll acknowledges the wake.
-            self.wake_signal.replace(wake_signal);
-            // Queue the request under this future's target sync point.
-            //
-            // The queued payload carries the following!
-            // 1. The task's waker, so the sync-point driver can wake it.
-            // 2. The wake handshake signal, so the driver can wait until the wake has actually
-            // been processed.
-            strong_world
-                .bridge_requests
-                .try_send(
-                    &self.system_set,
-                    BridgeRequest {
-                        waker: cx.waker().clone(),
-                        wake_waiter,
-                    },
-                )
-                .ok()
-                .unwrap();
-            Poll::Pending
-        } else {
-            // If we were previously woken by the sync-point driver, we will have a
-            // `WakeSignaler` stored here.
-            //
-            // Dropping that signal at the end of this poll acts as the
-            // acknowledgement that yes, this wake was observed and this task has
-            // attempted its run, you may release the waiting on the other side.
-            let _drop_at_end_of_scope = self
-                .wake_signal
-                .take()
-                .expect("future is only polled once, and we were woken after queuing");
-
+        let run_attempt = {
+            let Self {
+                ref system_state,
+                ref mut bridge_fn,
+                run,
+                ..
+            } = *self;
             strong_world
                 .world_scope
-                .try_with(|world| {
-                    let Self {
-                        ref system_state,
-                        ref mut bridge_fn,
-                        ..
-                    } = *self;
-                    // Lock the system state. The unwrap is safe since we only try_lock when we have
-                    // exclusive world access, so the lock must not be contested.
-                    let mut system_state = system_state.try_lock::<Func::Param>(world).expect("Lock
-                    should never be contended since we have exclusive world access");
-                    let param = system_state.get_mut(world);
-                    // We finally have `P::Item<'w, 's>`, yay!, so consume the stored `FnOnce`, run it,
-                    // and complete the future.
-                    let out = bridge_fn.take().unwrap().run(param);
-                    // Apply any deferred state (e.g. `Commands`) back into the world.
-                    system_state.apply(world);
-                    Poll::Ready(Ok(out))
-                })
-                .ok()
-                .expect("we have world access since we queued and were then woken")
+                .try_with(|world| run(bridge_fn.take().unwrap(), world, &**system_state))
+                .map_err(drop)
+        };
+
+        match run_attempt {
+            Ok(out) => {
+                let _ = self.wake_signal.take();
+                Poll::Ready(Ok(out))
+            }
+            Err(()) if !self.queued => {
+                // No world is currently exposed. That means we are being polled outside the
+                // `async_world_sync_point`, so we cannot access ECS yet, it would be
+                // an invalid scheduling concern!. Instead, enqueue ourselves to be revisited when
+                // the matching sync-point system runs.
+                self.queued = true;
+                let (wake_signal, wake_waiter) = wake_signal::pair();
+                // Store the wake_signal locally so dropping it at the end of the next
+                // poll acknowledges the wake.
+                self.wake_signal.replace(wake_signal);
+                // Queue the request under this future's target sync point.
+                //
+                // The queued payload carries the following!
+                // 1. The task's waker, so the sync-point driver can wake it.
+                // 2. The wake handshake signal, so the driver can wait until the wake has
+                //    actually been processed.
+                strong_world
+                    .bridge_requests
+                    .try_send(
+                        &self.system_set,
+                        BridgeRequest {
+                            waker: cx.waker().clone(),
+                            wake_waiter,
+                        },
+                    )
+                    .ok()
+                    .expect("the bridge queue is unbounded, so queueing cannot fail");
+                Poll::Pending
+            }
+            Err(()) => {
+                if self
+                    .wake_signal
+                    .as_ref()
+                    .expect("a queued future holds its wake signal until it completes")
+                    .was_notified()
+                {
+                    cx.waker().wake_by_ref();
+                }
+                // Otherwise a spurious poll occurred ( it can just happen randomly in async code )
+                // before our sync point ran. The genuine wake will re-poll us later.
+                Poll::Pending
+            }
         }
     }
 }
